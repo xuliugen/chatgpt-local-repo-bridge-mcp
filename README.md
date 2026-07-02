@@ -156,6 +156,8 @@ https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 公网暴露本地仓库 MCP 时建议启用 OAuth。当前实现把本服务作为 OAuth Resource Server，Auth0 负责用户登录和 access token 签发，本服务负责验证 JWT 签名、issuer、audience、过期时间和 scope。
 
+详细的 Auth0 Application、API、Permissions、ChatGPT Connector 配置和排错步骤见：[Auth0 OAuth 配置指南](docs/auth0-oauth-setup.md)。
+
 ### 1. Auth0 创建 API
 
 在 Auth0 Dashboard 中进入 `Applications -> APIs -> Create API`：
