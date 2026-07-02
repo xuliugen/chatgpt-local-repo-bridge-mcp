@@ -44,6 +44,8 @@ export interface AppConfig {
   maxSessions: number;
   /** 会话空闲 TTL */
   sessionTtlMs: number;
+  /** 达到会话上限时，允许被主动回收的最小空闲时间 */
+  sessionLimitReclaimIdleMs: number;
   /** 简易限流窗口 */
   rateLimitWindowMs: number;
   /** 每个窗口内每个来源允许的 /mcp 请求数 */
@@ -145,8 +147,9 @@ export function loadConfig(): AppConfig {
 
   const maxReadBytes = parseNumber(process.env.MAX_READ_BYTES, 1024 * 1024, 1024, 20 * 1024 * 1024);
   const maxWriteBytes = parseNumber(process.env.MAX_WRITE_BYTES, 2 * 1024 * 1024, 1024, 20 * 1024 * 1024);
-  const maxSessions = parseNumber(process.env.MAX_SESSIONS, 25, 1, 500);
-  const sessionTtlMs = parseNumber(process.env.SESSION_TTL_MS, 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000);
+  const maxSessions = parseNumber(process.env.MAX_SESSIONS, 100, 1, 500);
+  const sessionTtlMs = parseNumber(process.env.SESSION_TTL_MS, 10 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000);
+  const sessionLimitReclaimIdleMs = parseNumber(process.env.SESSION_LIMIT_RECLAIM_IDLE_MS, 2 * 60 * 1000, 30 * 1000, sessionTtlMs);
   const rateLimitWindowMs = parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 60 * 1000, 1000, 60 * 60 * 1000);
   const rateLimitMax = parseNumber(process.env.RATE_LIMIT_MAX, 120, 1, 10_000);
 
@@ -170,6 +173,7 @@ export function loadConfig(): AppConfig {
     maxWriteBytes,
     maxSessions,
     sessionTtlMs,
+    sessionLimitReclaimIdleMs,
     rateLimitWindowMs,
     rateLimitMax,
   };

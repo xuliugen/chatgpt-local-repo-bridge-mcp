@@ -87,16 +87,57 @@ export function createApp(): express.Express {
   const transports: Record<string, SessionRecord> = {};
   const rateLimits: Record<string, RateLimitRecord> = {};
 
+  function activeSessionCount(): number {
+    return Object.keys(transports).length;
+  }
+
+  function closeSession(sessionId: string, reason: string): void {
+    const record = transports[sessionId];
+    if (!record) return;
+
+    delete transports[sessionId];
+
+    const idleMs = Date.now() - record.lastSeen;
+    logger.warn(
+      `MCP 会话已回收: session=${shortSessionId(sessionId)} reason=${reason} idleMs=${idleMs} activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
+    );
+
+    void record.transport.close().catch((error) => {
+      logger.error(`关闭 MCP 会话 ${shortSessionId(sessionId)} 时出错:`, error);
+    });
+  }
+
   function cleanupSessions(): void {
     const now = Date.now();
     for (const [sessionId, record] of Object.entries(transports)) {
       if (now - record.lastSeen > config.sessionTtlMs) {
-        logger.warn(`MCP 会话已超时，正在关闭: ${sessionId}`);
-        void record.transport.close().catch((error) => {
-          logger.error(`关闭超时会话 ${sessionId} 时出错:`, error);
-        });
-        delete transports[sessionId];
+        closeSession(sessionId, 'idle_timeout');
       }
+    }
+  }
+
+  function reclaimIdleSessionsForCapacity(): void {
+    cleanupSessions();
+
+    const overflowCount = activeSessionCount() - config.maxSessions + 1;
+    if (overflowCount <= 0) return;
+
+    const now = Date.now();
+    const reclaimableSessionIds = Object.entries(transports)
+      .filter(([, record]) => now - record.lastSeen >= config.sessionLimitReclaimIdleMs)
+      .sort(([, left], [, right]) => left.lastSeen - right.lastSeen)
+      .slice(0, overflowCount)
+      .map(([sessionId]) => sessionId);
+
+    if (reclaimableSessionIds.length === 0) {
+      logger.warn(
+        `MCP 会话数达到上限，但没有可安全回收的空闲会话: activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions} minIdleMs=${config.sessionLimitReclaimIdleMs}`
+      );
+      return;
+    }
+
+    for (const sessionId of reclaimableSessionIds) {
+      closeSession(sessionId, 'session_limit_idle');
     }
   }
 
@@ -189,9 +230,12 @@ export function createApp(): express.Express {
         transports[sessionId].lastSeen = Date.now();
         transport = transports[sessionId].transport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
-        cleanupSessions();
+        reclaimIdleSessionsForCapacity();
 
-        if (Object.keys(transports).length >= config.maxSessions) {
+        if (activeSessionCount() >= config.maxSessions) {
+          logger.warn(
+            `MCP 会话数达到上限，拒绝新会话: activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
+          );
           res.status(503).json({
             jsonrpc: '2.0',
             error: {
@@ -305,13 +349,20 @@ export function createApp(): express.Express {
         status: 'ok',
         name: 'code-repo-mcp-server',
         version: '1.0.0',
-        activeSessions: Object.keys(transports).length,
+        activeSessions: activeSessionCount(),
+        maxSessions: config.maxSessions,
+        sessionLimitReclaimIdleMs: config.sessionLimitReclaimIdleMs,
         terminalEnabled: config.enableTerminal,
       });
       return;
     }
 
-    res.json({ status: 'ok' });
+    res.json({
+      status: 'ok',
+      activeSessions: activeSessionCount(),
+      maxSessions: config.maxSessions,
+      sessionLimitReclaimIdleMs: config.sessionLimitReclaimIdleMs,
+    });
   });
 
   // ===== 根路径信息 =====
