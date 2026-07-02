@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import { assertPathAllowed, resolvePath, isDirExcluded } from '../utils/path-guard.js';
+import { assertPathAllowed, resolvePath, isDirExcluded, isFileExcluded } from '../utils/path-guard.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { glob } from 'glob';
@@ -40,6 +40,8 @@ async function tryRipgrep(
     '--line-number',
     '--max-count', String(limit),
     ...config.excludedDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
+    ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!${p}`]),
+    ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!**/${p}`]),
   ];
 
   if (filePattern) {
@@ -122,7 +124,11 @@ async function nodeFallbackSearch(
     cwd: base,
     absolute: true,
     nodir: true,
-    ignore: config.excludedDirs.map((d) => `**/${d}/**`).concat(['**/*.lock']),
+    ignore: config.excludedDirs
+      .map((d) => `**/${d}/**`)
+      .concat(config.excludedFilePatterns)
+      .concat(config.excludedFilePatterns.map((p) => `**/${p}`))
+      .concat(['**/*.lock']),
   });
 
   const results: string[] = [];
@@ -133,7 +139,7 @@ async function nodeFallbackSearch(
     try {
       assertPathAllowed(file);
       const stats = await fs.stat(file);
-      if (!stats.isFile() || stats.size > Math.min(config.maxReadBytes, 1024 * 1024)) continue;
+      if (!stats.isFile() || isFileExcluded(path.basename(file)) || stats.size > Math.min(config.maxReadBytes, 1024 * 1024)) continue;
 
       const content = await fs.readFile(file, 'utf-8');
       const fileLines = content.split('\n');
@@ -195,14 +201,17 @@ export function registerSearchTools(server: McpServer): void {
         cwd: base,
         absolute: true,
         nodir: true,
-        ignore: config.excludedDirs.map((d) => `**/${d}/**`),
+        ignore: config.excludedDirs
+          .map((d) => `**/${d}/**`)
+          .concat(config.excludedFilePatterns)
+          .concat(config.excludedFilePatterns.map((p) => `**/${p}`)),
       });
 
       const limit = normalizeLimit(maxResults, 100, 500);
       const results = files.slice(0, limit).filter((file) => {
         try {
           assertPathAllowed(file);
-          return true;
+          return !isFileExcluded(path.basename(file));
         } catch {
           return false;
         }
@@ -312,7 +321,11 @@ async function buildTree(
     entries = entries.filter((e) => !e.name.startsWith('.'));
   }
 
-  entries = entries.filter((e) => !isDirExcluded(e.name));
+  entries = entries.filter((e) => {
+    if (e.isDirectory() && isDirExcluded(e.name)) return false;
+    if (e.isFile() && isFileExcluded(e.name)) return false;
+    return true;
+  });
 
   const sorted = entries.sort((a, b) => {
     if (a.isDirectory() && !b.isDirectory()) return -1;

@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import fs from 'node:fs';
 import path from 'node:path';
 
 // 加载 .env 文件
@@ -11,16 +12,18 @@ export interface AppConfig {
   workspaces: string[];
   /** 排除的目录名列表 (匹配任意层级，如 node_modules, dist, .git 等) */
   excludedDirs: string[];
+  /** 排除的敏感文件名 / glob 模式列表，仅匹配 basename */
+  excludedFilePatterns: string[];
   /** 允许的 CORS 来源 */
   allowedOrigins: string[];
   /** 可选 Bearer token；配置后所有 /mcp 请求必须携带 Authorization: Bearer <token> */
   authToken?: string;
   /** 是否注册任意命令执行工具 */
   enableTerminal: boolean;
-  /** 是否允许 run_command 执行任意命令；默认 false，建议只使用 allowedCommandPrefixes */
+  /** 是否允许 run_command 执行任意命令；默认 false，建议只使用 allowedCommands */
   allowAnyCommand: boolean;
-  /** run_command 允许的命令前缀列表 */
-  allowedCommandPrefixes: string[];
+  /** run_command 允许执行的完整命令列表 */
+  allowedCommands: string[];
   /** 是否允许 git push --force */
   allowGitForcePush: boolean;
   /** 是否在根路径公开详细工具清单 */
@@ -58,12 +61,29 @@ function parseNumber(value: string | undefined, defaultValue: number, min: numbe
   return Math.min(Math.max(Math.floor(parsed), min), max);
 }
 
+function validateWorkspace(workspace: string): string {
+  const resolved = path.resolve(workspace);
+  let stats: fs.Stats;
+
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new Error(`工作区目录不存在或不可访问: ${resolved}`);
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(`工作区路径不是目录: ${resolved}`);
+  }
+
+  return resolved;
+}
+
 export function loadConfig(): AppConfig {
   const port = parseNumber(process.env.PORT, 3100, 1, 65535);
 
-  const workspaces = parseList(process.env.WORKSPACES).map((p) =>
-    path.resolve(p)
-  );
+  const configuredWorkspaces = parseList(process.env.WORKSPACES);
+  const workspaces = (configuredWorkspaces.length > 0 ? configuredWorkspaces : [process.cwd()])
+    .map(validateWorkspace);
 
   const excludedDirs = parseList(process.env.EXCLUDED_DIRS);
   // 默认排除常见不需要访问或高风险的目录/文件夹名
@@ -75,21 +95,30 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  const excludedFilePatterns = parseList(process.env.EXCLUDED_FILES);
+  if (excludedFilePatterns.length === 0) {
+    excludedFilePatterns.push(
+      '.env', '.env.local', '.env.development', '.env.development.local', '.env.production', '.env.production.local', '.env.test', '.env.test.local', '.env.staging', '.env.staging.local', '.envrc', '.npmrc', '.pypirc',
+      '*.pem', '*.key', '*.crt', '*.cer',
+      '*.p12', '*.pfx',
+      'id_rsa', 'id_rsa.*', 'id_ed25519', 'id_ed25519.*'
+    );
+  }
+
   const allowedOrigins = parseList(process.env.ALLOWED_ORIGINS);
   // 如果没有配置 CORS 来源，仅允许 ChatGPT 常用域名；不要默认为 *。
   if (allowedOrigins.length === 0) {
     allowedOrigins.push('https://chatgpt.com', 'https://chat.openai.com');
   }
 
-  // 如果没有配置工作区，默认使用当前目录
-  if (workspaces.length === 0) {
-    workspaces.push(process.cwd());
-  }
-
   const authToken = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
   const enableTerminal = parseBoolean(process.env.ENABLE_TERMINAL, false);
   const allowAnyCommand = parseBoolean(process.env.ALLOW_ANY_COMMAND, false);
-  const allowedCommandPrefixes = parseList(process.env.ALLOWED_COMMAND_PREFIXES);
+  const allowedCommands = parseList(process.env.ALLOWED_COMMANDS);
+  // 向后兼容旧配置名；语义已经从“前缀”改为“完整命令”。
+  if (allowedCommands.length === 0) {
+    allowedCommands.push(...parseList(process.env.ALLOWED_COMMAND_PREFIXES));
+  }
   const allowGitForcePush = parseBoolean(process.env.ALLOW_GIT_FORCE_PUSH, false);
   const exposePublicInfo = parseBoolean(process.env.EXPOSE_PUBLIC_INFO, false);
 
@@ -104,11 +133,12 @@ export function loadConfig(): AppConfig {
     port,
     workspaces,
     excludedDirs,
+    excludedFilePatterns,
     allowedOrigins,
     authToken,
     enableTerminal,
     allowAnyCommand,
-    allowedCommandPrefixes,
+    allowedCommands,
     allowGitForcePush,
     exposePublicInfo,
     maxReadBytes,

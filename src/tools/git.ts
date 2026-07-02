@@ -6,7 +6,7 @@ import { simpleGit, SimpleGit } from 'simple-git';
 import { assertPathAllowed, resolvePath } from '../utils/path-guard.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
-import { destructiveLocalTool, readOnlyLocalTool, writeLocalTool } from '../utils/tool-annotations.js';
+import { destructiveLocalTool, destructiveRemoteTool, readOnlyLocalTool, writeLocalTool } from '../utils/tool-annotations.js';
 
 /**
  * 获取 Git 实例
@@ -35,6 +35,31 @@ function assertSafeGitRef(ref: string, label: string): void {
   }
   if (ref.startsWith('-') || /[\u0000-\u001f\s]/.test(ref)) {
     throw new Error(`${label} 包含不安全字符: ${ref}`);
+  }
+}
+
+function assertSafeBranchName(branch: string, label: string): void {
+  assertSafeGitRef(branch, label);
+
+  // 避免把 branch 参数当作 Git refspec 使用，例如 ":remote-branch" 或 "main:other"。
+  if (branch.includes(':')) {
+    throw new Error(`${label} 不能包含 refspec 分隔符 ':': ${branch}`);
+  }
+
+  if (
+    branch.includes('..') ||
+    branch.includes('~') ||
+    branch.includes('^') ||
+    branch.includes('?') ||
+    branch.includes('*') ||
+    branch.includes('[') ||
+    branch.includes('\\') ||
+    branch.endsWith('.') ||
+    branch.endsWith('/') ||
+    branch.includes('@{') ||
+    branch === '@'
+  ) {
+    throw new Error(`${label} 包含不安全的 Git ref 字符: ${branch}`);
   }
 }
 
@@ -276,7 +301,7 @@ export function registerGitTools(server: McpServer): void {
             isError: true,
           };
         }
-        assertSafeGitRef(branchName, '分支名称');
+        assertSafeBranchName(branchName, '分支名称');
       }
 
       logger.info(`git_branch: ${resolved} action=${action} branch=${branchName}`);
@@ -352,11 +377,11 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Push',
       description: '将本地提交推送到远程仓库。默认禁止 force push，可通过 ALLOW_GIT_FORCE_PUSH=true 显式启用。',
-      annotations: destructiveLocalTool,
+      annotations: destructiveRemoteTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         remote: z.string().optional().describe('远程仓库名，默认为 origin'),
-        branch: z.string().optional().describe('远程分支名，默认为当前分支'),
+        branch: z.string().optional().describe('远程分支名，默认为当前分支；必须是分支名，不能是 refspec'),
         force: z.boolean().optional().describe('是否强制推送 (慎用)，默认为 false，且需要 ALLOW_GIT_FORCE_PUSH=true'),
       },
     },
@@ -366,7 +391,7 @@ export function registerGitTools(server: McpServer): void {
 
       const remoteName = remote ?? 'origin';
       assertSafeRemote(remoteName);
-      if (branch) assertSafeGitRef(branch, '远程分支名');
+      if (branch) assertSafeBranchName(branch, '远程分支名');
 
       if (force && !config.allowGitForcePush) {
         return {
@@ -404,11 +429,11 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Pull',
       description: '从远程仓库拉取变更并合并到当前分支。会修改工作区，因此标记为 destructive。',
-      annotations: destructiveLocalTool,
+      annotations: destructiveRemoteTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         remote: z.string().optional().describe('远程仓库名，默认为 origin'),
-        branch: z.string().optional().describe('远程分支名，默认为当前分支'),
+        branch: z.string().optional().describe('远程分支名，默认为当前分支；必须是分支名，不能是 refspec'),
         rebase: z.boolean().optional().describe('是否使用 rebase 代替 merge，默认为 false'),
       },
     },
@@ -418,7 +443,7 @@ export function registerGitTools(server: McpServer): void {
 
       const remoteName = remote ?? 'origin';
       assertSafeRemote(remoteName);
-      if (branch) assertSafeGitRef(branch, '远程分支名');
+      if (branch) assertSafeBranchName(branch, '远程分支名');
 
       logger.info(`git_pull: ${resolved} remote=${remoteName} branch=${branch ?? '(current)'} rebase=${rebase}`);
 

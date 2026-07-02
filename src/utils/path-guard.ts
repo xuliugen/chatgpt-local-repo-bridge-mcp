@@ -6,7 +6,7 @@ import { config } from '../config.js';
  * 路径安全守卫
  * - 确保文件操作在允许的工作区目录内
  * - 使用 realpath 防止 workspace 内 symlink 指向外部目录
- * - 阻止访问被排除目录
+ * - 阻止访问被排除目录和敏感文件
  */
 
 interface WorkspaceMatch {
@@ -92,6 +92,33 @@ function getMatchedWorkspace(targetPath: string): WorkspaceMatch | null {
   return null;
 }
 
+function escapeRegex(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function matchesSimpleGlob(fileName: string, pattern: string): boolean {
+  const normalizedName = fileName.toLowerCase();
+  const normalizedPattern = pattern.toLowerCase();
+  const regex = new RegExp(`^${escapeRegex(normalizedPattern).replace(/\*/g, '.*')}$`);
+  return regex.test(normalizedName);
+}
+
+function assertFileNotExcluded(targetPath: string): void {
+  if (config.excludedFilePatterns.length === 0) return;
+
+  const baseName = path.basename(targetPath);
+  const matchedPattern = config.excludedFilePatterns.find((pattern) =>
+    matchesSimpleGlob(baseName, pattern)
+  );
+
+  if (matchedPattern) {
+    throw new Error(
+      `路径 "${targetPath}" 匹配被排除的敏感文件模式 "${matchedPattern}"。\n` +
+        `被排除的文件模式: ${config.excludedFilePatterns.join(', ')}`
+    );
+  }
+}
+
 /**
  * 检查路径是否在允许的工作区内
  * @throws Error 如果路径越权
@@ -126,26 +153,30 @@ export function assertNotWorkspaceRoot(targetPath: string, operation: string): v
 }
 
 /**
- * 检查路径是否包含被排除的目录段
- * @throws Error 如果路径包含被排除目录
+ * 检查路径是否包含被排除的目录段或敏感文件名
+ * @throws Error 如果路径包含被排除目录或敏感文件
  */
 export function assertPathNotExcluded(targetPath: string, workspaceRoot: string): void {
-  if (config.excludedDirs.length === 0) return;
+  const canonicalTarget = canonicalizeTarget(targetPath);
 
-  const relativePath = path.relative(workspaceRoot, canonicalizeTarget(targetPath));
-  if (!relativePath || relativePath === '.') return;
+  if (config.excludedDirs.length > 0) {
+    const relativePath = path.relative(workspaceRoot, canonicalTarget);
+    if (relativePath && relativePath !== '.') {
+      const segments = relativePath.split(path.sep);
+      const excludedSet = new Set(config.excludedDirs);
 
-  const segments = relativePath.split(path.sep);
-  const excludedSet = new Set(config.excludedDirs);
-
-  for (const segment of segments) {
-    if (excludedSet.has(segment)) {
-      throw new Error(
-        `路径 "${targetPath}" 包含被排除的目录 "${segment}"。\n` +
-          `被排除的目录: ${config.excludedDirs.join(', ')}`
-      );
+      for (const segment of segments) {
+        if (excludedSet.has(segment)) {
+          throw new Error(
+            `路径 "${targetPath}" 包含被排除的目录 "${segment}"。\n` +
+              `被排除的目录: ${config.excludedDirs.join(', ')}`
+          );
+        }
+      }
     }
   }
+
+  assertFileNotExcluded(canonicalTarget);
 }
 
 /**
@@ -153,6 +184,13 @@ export function assertPathNotExcluded(targetPath: string, workspaceRoot: string)
  */
 export function isDirExcluded(dirName: string): boolean {
   return config.excludedDirs.includes(dirName);
+}
+
+/**
+ * 检查文件名是否被排除 (用于遍历和搜索时过滤)
+ */
+export function isFileExcluded(fileName: string): boolean {
+  return config.excludedFilePatterns.some((pattern) => matchesSimpleGlob(fileName, pattern));
 }
 
 /**

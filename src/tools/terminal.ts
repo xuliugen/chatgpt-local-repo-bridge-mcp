@@ -15,9 +15,15 @@ function redactCommand(command: string): string {
   return command.replace(/(token|secret|password|passwd|api[_-]?key|authorization)\s*[=:]\s*[^\s]+/gi, '$1=<redacted>');
 }
 
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, ' ');
+}
+
 function isCommandAllowed(command: string): boolean {
   if (config.allowAnyCommand) return true;
-  return config.allowedCommandPrefixes.some((prefix) => command.trim().startsWith(prefix));
+
+  const normalizedCommand = normalizeCommand(command);
+  return config.allowedCommands.some((allowed) => normalizeCommand(allowed) === normalizedCommand);
 }
 
 function sanitizeEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
@@ -47,10 +53,10 @@ export function registerTerminalTools(server: McpServer): void {
     {
       title: 'Run Command',
       description:
-        '在指定目录下执行 shell 命令。此工具高风险，默认不注册；启用后仍默认只允许 ALLOWED_COMMAND_PREFIXES 中配置的命令前缀。',
+        '在指定目录下执行 shell 命令。此工具高风险，默认不注册；启用后仍默认只允许 ALLOWED_COMMANDS 中配置的完整命令。',
       annotations: openWorldDestructiveTool,
       inputSchema: {
-        command: z.string().min(1).max(500).describe('要执行的 shell 命令'),
+        command: z.string().min(1).max(500).describe('要执行的 shell 命令；默认必须完整匹配 ALLOWED_COMMANDS 中的一项'),
         cwd: z.string().describe('命令执行的工作目录'),
         timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).optional().describe('命令超时时间 (毫秒)，默认 30000，最高 120000'),
         env: z.record(z.string(), z.string()).optional().describe('额外的环境变量；禁止覆盖 NODE_OPTIONS 和 npm_config_script_shell'),
@@ -65,7 +71,7 @@ export function registerTerminalTools(server: McpServer): void {
           content: [{
             type: 'text',
             text:
-              '命令已被拒绝: run_command 当前只允许 ALLOWED_COMMAND_PREFIXES 中配置的命令前缀。' +
+              '命令已被拒绝: run_command 当前只允许 ALLOWED_COMMANDS 中配置的完整命令。' +
               '\n如确需开放任意命令，请设置 ALLOW_ANY_COMMAND=true，但不建议在公网环境使用。',
           }],
           isError: true,

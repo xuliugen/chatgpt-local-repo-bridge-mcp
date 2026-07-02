@@ -18,6 +18,12 @@ export const destructiveLocalTool: ToolAnnotations = {
   openWorldHint: false,
 };
 
+export const destructiveRemoteTool: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  openWorldHint: true,
+};
+
 export const openWorldDestructiveTool: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: true,

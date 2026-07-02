@@ -8,6 +8,7 @@ import {
   assertPathAllowed,
   resolvePath,
   isDirExcluded,
+  isFileExcluded,
 } from '../utils/path-guard.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
@@ -388,6 +389,7 @@ async function listDir(
 
   const filtered = entries.filter((e) => {
     if (e.isDirectory() && isDirExcluded(e.name)) return false;
+    if (e.isFile() && isFileExcluded(e.name)) return false;
     return true;
   });
 

@@ -89,6 +89,14 @@ export function createApp(): express.Express {
 
     if (!record || now - record.windowStartedAt > config.rateLimitWindowMs) {
       rateLimits[key] = { windowStartedAt: now, count: 1 };
+
+      // 顺手清理过期来源，避免长期公网暴露时 rateLimits 无界增长。
+      for (const [storedKey, storedRecord] of Object.entries(rateLimits)) {
+        if (now - storedRecord.windowStartedAt > config.rateLimitWindowMs) {
+          delete rateLimits[storedKey];
+        }
+      }
+
       next();
       return;
     }
