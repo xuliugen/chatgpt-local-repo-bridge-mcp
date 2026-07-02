@@ -5,9 +5,16 @@
 ## 架构
 
 ```
-ChatGPT 网页端
+ChatGPT 网页端 (chatgpt.com)
       |
-      | Streamable HTTP Transport
+      | HTTPS (Streamable HTTP Transport)
+      v
++-------------------------------+
+|  ngrok 隧道 (公网 HTTPS 地址)  |
+|  https://xxx.ngrok-free.app   |
++-------------------------------+
+      |
+      | 本地转发 → localhost:3100
       v
 +-------------------------------+
 |  MCP Server (localhost:3100)  |
@@ -71,12 +78,175 @@ npm run dev
 npm run build && npm start
 ```
 
-### 4. 连接 ChatGPT
+### 4. 使用 ngrok 内网穿透
 
-1. 打开 [ChatGPT 网页端](https://chatgpt.com)
-2. 进入 **设置 → 连接器 → 添加 MCP 服务器**
-3. 选择 **Streamable HTTP** 类型
-4. 输入 URL：`http://localhost:3100/mcp`
+ChatGPT 网页端运行在云端，**无法直接访问你电脑上的 `localhost:3100`**。必须通过内网穿透工具将本地服务暴露为公网 HTTPS 地址，ChatGPT 才能连接。这里使用 [ngrok](https://ngrok.com/) 实现。
+
+#### 4.1 注册 ngrok 账号
+
+1. 访问 [ngrok 官网](https://ngrok.com/)，点击 **Sign Up** 注册账号（免费版即可）
+2. 注册后在 [Dashboard](https://dashboard.ngrok.com/) 页面找到你的 **Authtoken**
+
+#### 4.2 安装 ngrok
+
+**Windows（推荐用 npm 安装）：**
+
+```bash
+npm install -g ngrok
+```
+
+**Windows（独立安装包）：**
+
+1. 从 [ngrok 下载页](https://ngrok.com/download) 下载 `ngrok-v3-stable-windows-amd64.zip`
+2. 解压得到 `ngrok.exe`，将其所在目录加入系统 `PATH` 环境变量
+
+**macOS：**
+
+```bash
+brew install ngrok
+```
+
+**Linux：**
+
+```bash
+snap install ngrok
+```
+
+#### 4.3 配置 Authtoken
+
+将 Dashboard 中的 Authtoken 配置到本地（只需执行一次）：
+
+```bash
+ngrok config add-authtoken <你的Authtoken>
+```
+
+配置完成后会生成 `~/.config/ngrok/ngrok.yml`（Windows 为 `%USERPROFILE%\AppData\Local\ngrok\ngrok.yml`）。
+
+#### 4.4 启动 MCP 服务
+
+确保本地 MCP Server 已启动（端口默认 3100）：
+
+```bash
+npm run dev
+```
+
+启动后确认 `http://localhost:3100/health` 可正常访问。
+
+#### 4.5 启动 ngrok 隧道
+
+另开一个终端窗口，将本地 3100 端口暴露为公网 HTTPS 地址：
+
+```bash
+ngrok http 3100
+```
+
+启动后终端会显示类似输出：
+
+```
+Session Status                online
+Account                       your-email@example.com (Plan: Free)
+Version                       3.x.x
+Region                        United States (Us)
+Latency                       -
+Web Interface                 http://127.0.0.1:4040
+Forwarding                    https://a1b2-203-0-113-1.ngrok-free.app -> http://localhost:3100
+
+Connections                   ttl     opn     rt1     rt5     p50     p90
+```
+
+> **关键信息：** 复制 `Forwarding` 行中的 HTTPS 地址，例如 `https://a1b2-203-0-113-1.ngrok-free.app`。这就是 ChatGPT 将要连接的公网地址。
+
+#### 4.6 验证隧道
+
+在浏览器中访问以下地址确认隧道正常工作：
+
+- **健康检查：** `https://<你的ngrok地址>/health` — 应返回 `{"status":"ok",...}`
+- **服务信息：** `https://<你的ngrok地址>/` — 应返回服务名称和工具列表
+
+如果看到 ngrok 的警告页面（"Visit Site"），点击即可继续，这是免费版的正常行为。
+
+#### 4.7 保持 ngrok 运行
+
+> **注意：** ngrok 免费版每次重启隧道地址会变化。如果需要固定域名，可升级到付费版使用 `ngrok http 3100 --domain=your-domain.ngrok.app`。免费版下，每次重启 ngrok 后需要到 ChatGPT 更新连接器 URL。
+
+---
+
+### 5. 在 ChatGPT 中配置 MCP 应用
+
+ngrok 隧道启动后，将公网 HTTPS 地址配置到 ChatGPT 网页端。当前 ChatGPT 通过 **开发者模式 + 自定义应用（Custom App）** 来连接 MCP 服务器。
+
+> **前提条件：** MCP 应用功能需要 ChatGPT 付费订阅（Plus / Team / Pro 等），免费版不可用。详见 [OpenAI 开发者模式文档](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)。
+
+#### 5.1 确认 CORS 配置
+
+确保 `.env` 中的 `ALLOWED_ORIGINS` 包含 ChatGPT 的域名（**无需添加 ngrok 地址**，因为请求的 `Origin` 头来自浏览器中的 chatgpt.com）：
+
+```env
+ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
+```
+
+修改后重启 MCP Server 使配置生效。
+
+#### 5.2 开启开发者模式
+
+1. 打开 [ChatGPT 网页端](https://chatgpt.com) 并登录
+2. 点击左下角用户头像，打开 **Settings（设置）** 弹窗（也可直接访问 [chatgpt.com/#settings](https://chatgpt.com/#settings)）
+3. 滚动到设置页面**底部**，点击 **Advanced Settings（高级设置）**
+4. 将 **Developer mode（开发者模式）** 开关切换为**开启**
+
+#### 5.3 创建 MCP 应用
+
+1. 开启开发者模式后，在同一个设置弹窗中切换到 **Apps & Connectors（应用与连接器）** 选项卡
+2. 点击页面右上角的 **Create** 按钮
+3. 在弹出的表单中填写应用信息：
+
+| 字段 | 填写内容 |
+|------|----------|
+| **Name（名称）** | 自定义，如 `Code Repo MCP` |
+| **Description（描述）** | 可选，如 `Local code repository operations` |
+| **MCP Server URL** | `https://<你的ngrok地址>/mcp` |
+| **Authentication（认证）** | 选择 `None` |
+
+> **重要：** MCP Server URL 必须以 `/mcp` 结尾。例如 ngrok 转发地址为 `https://a1b2-203-0-113-1.ngrok-free.app`，则完整 URL 为 `https://a1b2-203-0-113-1.ngrok-free.app/mcp`。
+
+4. 勾选 **"I understand and want to continue"（我已了解并希望继续）** 复选框
+5. 点击 **Create** 创建应用
+
+#### 5.4 验证应用状态
+
+1. 返回 ChatGPT 主界面，顶部应显示 **Developer mode** 标识，表示 MCP 应用已启用
+2. 如果没有看到标识，刷新页面；若仍未出现，回到 **Advanced Settings** 确认开发者模式开关已打开
+3. 在 **Apps & Connectors** 选项卡中确认刚创建的应用状态为已启用
+
+#### 5.5 在对话中使用 MCP 工具
+
+1. 在 ChatGPT 聊天输入框中点击 **`+`** 按钮
+2. 选择 **More**
+3. 选择你创建的 **Code Repo MCP** 应用将其附加到当前对话
+4. 输入测试指令，例如：
+
+```
+列出我的项目根目录下的文件
+```
+
+ChatGPT 会调用 `list_directory` 工具并返回结果。首次工具调用时可能出现确认提示，点击允许即可（可勾选 "Remember for this conversation" 避免重复确认）。
+
+> **提示：** 每个新对话都需要重新通过 **`+` → More → 选择应用** 来附加 MCP 连接器。
+
+你也可以在 **ngrok Web Interface**（`http://127.0.0.1:4040`）中查看实时请求日志，确认请求是否正常转发到本地服务。
+
+#### 5.6 常见问题排查
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 设置中没有 Advanced Settings | 未使用付费版 ChatGPT | 升级至 Plus / Team / Pro 等付费订阅 |
+| 设置中没有 Apps & Connectors | 开发者模式未开启 | 在 Advanced Settings 中开启 Developer mode |
+| 应用创建后连接失败 | ngrok 隧道未启动或地址已变 | 重启 ngrok，更新应用中的 MCP Server URL |
+| CORS 错误 | `ALLOWED_ORIGINS` 未包含 chatgpt 域名 | 添加 `https://chatgpt.com,https://chat.openai.com` 并重启服务 |
+| 工具调用报路径不在工作区 | `WORKSPACES` 未配置目标目录 | 在 `.env` 中添加目标目录路径 |
+| 对话中看不到 MCP 工具 | 未在当前对话附加应用 | 点击 **`+`** → **More** → 选择已创建的应用 |
+| 请求超时 | 本地服务未运行 / 端口不匹配 | 确认 MCP Server 在 3100 端口运行 |
+| ngrok 免费版拦截页面 | 免费版首次访问有警告页 | 在浏览器中先访问一次 ngrok 地址并点击 "Visit Site"，ChatGPT 端通常不受影响 |
 
 ## 工具列表 (21 个 Tools)
 
