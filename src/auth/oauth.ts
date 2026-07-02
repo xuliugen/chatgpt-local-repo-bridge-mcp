@@ -32,6 +32,19 @@ const GIT_WRITE_TOOLS = new Set([
   'git_pull',
 ]);
 
+const READ_TOOLS = new Set([
+  'list_directory',
+  'read_file',
+  'get_file_info',
+  'search_files',
+  'search_content',
+  'get_file_tree',
+  'git_status',
+  'git_diff',
+  'git_log',
+  'git_show',
+]);
+
 const HIGH_RISK_TOOLS = new Set([
   'run_command',
 ]);
@@ -130,24 +143,41 @@ export function requiredScopesForRequest(req: Request): string[] {
       continue;
     }
 
-    requiredScopes.add(OAUTH_SCOPES.read);
+    if (READ_TOOLS.has(toolCall.name)) {
+      requiredScopes.add(OAUTH_SCOPES.read);
+      continue;
+    }
+
+    // 未分类的新工具按 fail-closed 处理，避免新增写入/高风险工具时忘记补 scope 映射。
+    for (const scope of config.oauthScopes) {
+      requiredScopes.add(scope);
+    }
   }
 
   return Array.from(requiredScopes);
 }
 
 function tokenScopes(payload: JwtPayload): string[] {
+  const scopes = new Set<string>();
+
   const rawScope = payload.scope;
   if (typeof rawScope === 'string') {
-    return rawScope.split(/\s+/).map((scope) => scope.trim()).filter(Boolean);
+    for (const scope of rawScope.split(/\s+/)) {
+      const trimmed = scope.trim();
+      if (trimmed) scopes.add(trimmed);
+    }
   }
 
   const permissions = payload.permissions;
   if (Array.isArray(permissions)) {
-    return permissions.filter((scope): scope is string => typeof scope === 'string');
+    for (const permission of permissions) {
+      if (typeof permission === 'string' && permission.trim()) {
+        scopes.add(permission.trim());
+      }
+    }
   }
 
-  return [];
+  return Array.from(scopes);
 }
 
 function hasRequiredScopes(payload: JwtPayload, requiredScopes: string[]): boolean {
