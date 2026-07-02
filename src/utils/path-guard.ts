@@ -4,18 +4,92 @@ import { config } from '../config.js';
 
 /**
  * 路径安全守卫
- * 确保所有文件操作都在允许的工作区目录内
+ * - 确保文件操作在允许的工作区目录内
+ * - 使用 realpath 防止 workspace 内 symlink 指向外部目录
+ * - 阻止访问被排除目录
  */
+
+interface WorkspaceMatch {
+  configuredRoot: string;
+  realRoot: string;
+}
 
 /**
  * 将输入路径解析为绝对路径
  */
 export function resolvePath(inputPath: string): string {
-  // 支持 ~ 展开为 home 目录
-  if (inputPath.startsWith('~')) {
-    inputPath = path.join(process.env.HOME || '', inputPath.slice(1));
+  if (!inputPath || typeof inputPath !== 'string') {
+    throw new Error('路径不能为空');
   }
+
+  // 支持 ~ 展开为 home 目录
+  if (inputPath === '~' || inputPath.startsWith(`~${path.sep}`) || inputPath.startsWith('~/')) {
+    inputPath = path.join(process.env.HOME || process.env.USERPROFILE || '', inputPath.slice(1));
+  }
+
   return path.resolve(inputPath);
+}
+
+function realpathIfExists(targetPath: string): string | null {
+  try {
+    return fs.realpathSync.native(targetPath);
+  } catch {
+    return null;
+  }
+}
+
+function nearestExistingAncestor(targetPath: string): string | null {
+  let current = path.resolve(targetPath);
+
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+
+  return current;
+}
+
+function canonicalizeTarget(targetPath: string): string {
+  const resolved = resolvePath(targetPath);
+  const realExisting = realpathIfExists(resolved);
+  if (realExisting) return realExisting;
+
+  const ancestor = nearestExistingAncestor(resolved);
+  if (!ancestor) return resolved;
+
+  const ancestorReal = realpathIfExists(ancestor);
+  if (!ancestorReal) return resolved;
+
+  const suffix = path.relative(ancestor, resolved);
+  return path.resolve(ancestorReal, suffix);
+}
+
+function canonicalizeWorkspace(workspace: string): string {
+  const resolved = resolvePath(workspace);
+  const real = realpathIfExists(resolved);
+  if (!real) {
+    throw new Error(`工作区目录不存在或不可访问: ${resolved}`);
+  }
+  return real;
+}
+
+function isPathInside(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function getMatchedWorkspace(targetPath: string): WorkspaceMatch | null {
+  const canonicalTarget = canonicalizeTarget(targetPath);
+
+  for (const workspace of config.workspaces) {
+    const realRoot = canonicalizeWorkspace(workspace);
+    if (isPathInside(canonicalTarget, realRoot)) {
+      return { configuredRoot: workspace, realRoot };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -24,16 +98,8 @@ export function resolvePath(inputPath: string): string {
  */
 export function assertPathAllowed(targetPath: string): void {
   const resolved = resolvePath(targetPath);
-
-  // 第一步: 检查是否在工作区内
-  const matchedWorkspace = config.workspaces.find((workspace) => {
-    const normalizedTarget = resolved + path.sep;
-    const normalizedWorkspace = workspace + path.sep;
-    return (
-      normalizedTarget.startsWith(normalizedWorkspace) ||
-      resolved === workspace
-    );
-  });
+  const canonicalTarget = canonicalizeTarget(resolved);
+  const matchedWorkspace = getMatchedWorkspace(resolved);
 
   if (!matchedWorkspace) {
     throw new Error(
@@ -42,8 +108,21 @@ export function assertPathAllowed(targetPath: string): void {
     );
   }
 
-  // 第二步: 检查路径是否包含被排除的目录
-  assertPathNotExcluded(resolved, matchedWorkspace);
+  assertPathNotExcluded(canonicalTarget, matchedWorkspace.realRoot);
+}
+
+/**
+ * 阻止危险操作直接作用于工作区根目录。
+ */
+export function assertNotWorkspaceRoot(targetPath: string, operation: string): void {
+  const canonicalTarget = canonicalizeTarget(targetPath);
+
+  for (const workspace of config.workspaces) {
+    const realRoot = canonicalizeWorkspace(workspace);
+    if (canonicalTarget === realRoot) {
+      throw new Error(`${operation} 被拒绝: 不允许直接操作工作区根目录 "${workspace}"`);
+    }
+  }
 }
 
 /**
@@ -53,8 +132,7 @@ export function assertPathAllowed(targetPath: string): void {
 export function assertPathNotExcluded(targetPath: string, workspaceRoot: string): void {
   if (config.excludedDirs.length === 0) return;
 
-  // 取工作区根之后的相对部分
-  const relativePath = path.relative(workspaceRoot, targetPath);
+  const relativePath = path.relative(workspaceRoot, canonicalizeTarget(targetPath));
   if (!relativePath || relativePath === '.') return;
 
   const segments = relativePath.split(path.sep);

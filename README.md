@@ -1,35 +1,43 @@
 # Code Repository MCP Server
 
-通过 MCP (Model Context Protocol) 协议让 ChatGPT 网页端直接操作本地代码仓库，支持文件增删改查、代码搜索、Git 操作和终端命令执行。
+通过 MCP (Model Context Protocol) 协议让 ChatGPT 网页端操作本地代码仓库。默认提供文件、搜索、Git 相关工具；高风险的终端命令执行工具默认关闭，需要显式启用。
+
+> 公网暴露本地代码仓库能力风险很高。建议仅在可信网络、短时 ngrok 隧道、明确工作区白名单、必要时配置认证的前提下使用。
 
 ## 架构
 
-```
+```text
 ChatGPT 网页端 (chatgpt.com)
       |
-      | HTTPS (Streamable HTTP Transport)
+      | HTTPS / Streamable HTTP Transport
       v
 +-------------------------------+
-|  ngrok 隧道 (公网 HTTPS 地址)  |
-|  https://xxx.ngrok-free.app   |
+|  ngrok / 其他 HTTPS 隧道       |
+|  https://xxx.ngrok-free.dev   |
 +-------------------------------+
       |
-      | 本地转发 → localhost:3100
+      | 转发到 localhost:3100
       v
-+-------------------------------+
-|  MCP Server (localhost:3100)  |
-|                               |
-|  Tools (21个)                 |
-|  ├── filesystem  (8)          |
-|  ├── search      (3)          |
-|  ├── git         (9)          |
-|  └── terminal    (1)          |
-|                               |
-|  安全层                       |
-|  ├── 工作区路径白名单          |
-|  ├── 排除目录黑名单            |
-|  └── CORS 来源限制            |
-+-------------------------------+
++----------------------------------------------+
+|  MCP Server (localhost:3100)                 |
+|                                              |
+|  默认 Tools (20 个)                          |
+|  ├── filesystem  (8)                         |
+|  ├── search      (3)                         |
+|  └── git         (9)                         |
+|                                              |
+|  可选高风险 Tools                            |
+|  └── terminal    (1, ENABLE_TERMINAL=true)   |
+|                                              |
+|  安全层                                      |
+|  ├── 工作区路径白名单                         |
+|  ├── realpath / symlink 越权防护              |
+|  ├── 排除目录黑名单                           |
+|  ├── 文件读写大小限制                         |
+|  ├── 可选 Bearer Token 认证                   |
+|  ├── MCP session TTL / 最大会话数             |
+|  └── 简易请求限流                             |
++----------------------------------------------+
 ```
 
 ## 快速开始
@@ -44,293 +52,416 @@ npm install
 
 复制 `.env.example` 为 `.env` 并按需修改：
 
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+推荐的基础配置：
+
 ```env
 # MCP Server 端口
 PORT=3100
 
-# 允许访问的工作区目录 (逗号分隔，支持多个目录)
-WORKSPACES=/Users/you/Dev/Code,/Users/you/Projects
+# 允许访问的工作区目录，逗号分隔，支持多个目录
+WORKSPACES=D:\CodeX\chatgpt-local-repo-bridge-mcp,D:\CodeX\mindx-agent
 
-# 排除的目录名 (逗号分隔，匹配任意层级)
-# 不配置则使用默认值: node_modules,.git,dist,build,.next,.nuxt,__pycache__,.venv,.tox,venv,.cache,coverage
-EXCLUDED_DIRS=node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage
+# 排除的目录名，匹配任意层级
+EXCLUDED_DIRS=node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,DS_Store,.qoder
 
-# 允许的跨域来源 (逗号分隔)
+# 允许的跨域来源。CORS 不是鉴权。
 ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
+
+# 可选 Bearer token。若 ChatGPT 连接器未配置对应认证，请先留空。
+MCP_AUTH_TOKEN=
+
+# 公网建议 false，避免 / 和 /health 暴露工具清单、会话数等信息。
+EXPOSE_PUBLIC_INFO=false
+
+# 终端命令执行默认关闭。公网建议保持 false。
+ENABLE_TERMINAL=false
+
+# 若启用 run_command，默认只允许这些命令前缀。
+ALLOWED_COMMAND_PREFIXES=npm run build,npm test,git status
+ALLOW_ANY_COMMAND=false
+
+# 默认禁止 force push。
+ALLOW_GIT_FORCE_PUSH=false
+
+# 文件读写限制
+MAX_READ_BYTES=1048576
+MAX_WRITE_BYTES=2097152
+
+# MCP 会话与限流
+MAX_SESSIONS=25
+SESSION_TTL_MS=1800000
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=120
 ```
-
-**配置说明：**
-
-| 变量 | 作用 | 默认值 |
-|------|------|--------|
-| `PORT` | 服务端口 | `3100` |
-| `WORKSPACES` | 允许访问的目录，逗号分隔多个路径 | 当前目录 |
-| `EXCLUDED_DIRS` | 排除的目录名 (匹配任意层级) | `node_modules,.git,dist,...` |
-| `ALLOWED_ORIGINS` | CORS 允许的域名 | `*` (开发模式) |
 
 ### 3. 启动服务
 
-```bash
-# 开发模式 (热重载)
-npm run dev
-
-# 生产模式
-npm run build && npm start
-```
-
-### 4. 使用 ngrok 内网穿透
-
-ChatGPT 网页端运行在云端，**无法直接访问你电脑上的 `localhost:3100`**。必须通过内网穿透工具将本地服务暴露为公网 HTTPS 地址，ChatGPT 才能连接。这里使用 [ngrok](https://ngrok.com/) 实现。
-
-#### 4.1 注册 ngrok 账号
-
-1. 访问 [ngrok 官网](https://ngrok.com/)，点击 **Sign Up** 注册账号（免费版即可）
-2. 注册后在 [Dashboard](https://dashboard.ngrok.com/) 页面找到你的 **Authtoken**
-
-#### 4.2 安装 ngrok
-
-**Windows（推荐用 npm 安装）：**
-
-```bash
-npm install -g ngrok
-```
-
-**Windows（独立安装包）：**
-
-1. 从 [ngrok 下载页](https://ngrok.com/download) 下载 `ngrok-v3-stable-windows-amd64.zip`
-2. 解压得到 `ngrok.exe`，将其所在目录加入系统 `PATH` 环境变量
-
-**macOS：**
-
-```bash
-brew install ngrok
-```
-
-**Linux：**
-
-```bash
-snap install ngrok
-```
-
-#### 4.3 配置 Authtoken
-
-将 Dashboard 中的 Authtoken 配置到本地（只需执行一次）：
-
-```bash
-ngrok config add-authtoken <你的Authtoken>
-```
-
-配置完成后会生成 `~/.config/ngrok/ngrok.yml`（Windows 为 `%USERPROFILE%\AppData\Local\ngrok\ngrok.yml`）。
-
-#### 4.4 启动 MCP 服务
-
-确保本地 MCP Server 已启动（端口默认 3100）：
+开发模式：
 
 ```bash
 npm run dev
 ```
 
-启动后确认 `http://localhost:3100/health` 可正常访问。
+生产模式：
 
-#### 4.5 启动 ngrok 隧道
+```bash
+npm run build
+npm start
+```
 
-另开一个终端窗口，将本地 3100 端口暴露为公网 HTTPS 地址：
+启动后本地健康检查：
+
+```text
+http://localhost:3100/health
+```
+
+默认返回：
+
+```json
+{"status":"ok"}
+```
+
+## 使用 ngrok 暴露 HTTPS 地址
+
+ChatGPT 运行在云端，不能直接访问你本机的 `localhost:3100`。需要通过 ngrok、Cloudflare Tunnel 或其他方式把本地服务暴露为公网 HTTPS 地址。
+
+### 1. 启动本地 MCP Server
+
+```bash
+npm run dev
+```
+
+### 2. 启动 ngrok
 
 ```bash
 ngrok http 3100
 ```
 
-启动后终端会显示类似输出：
+ngrok 会输出类似内容：
 
-```
-Session Status                online
-Account                       your-email@example.com (Plan: Free)
-Version                       3.x.x
-Region                        United States (Us)
-Latency                       -
-Web Interface                 http://127.0.0.1:4040
-Forwarding                    https://a1b2-203-0-113-1.ngrok-free.app -> http://localhost:3100
-
-Connections                   ttl     opn     rt1     rt5     p50     p90
+```text
+Forwarding  https://a1b2-203-0-113-1.ngrok-free.dev -> http://localhost:3100
 ```
 
-> **关键信息：** 复制 `Forwarding` 行中的 HTTPS 地址，例如 `https://a1b2-203-0-113-1.ngrok-free.app`。这就是 ChatGPT 将要连接的公网地址。
+复制 `Forwarding` 中的 HTTPS 地址。
 
-#### 4.6 验证隧道
+### 3. 验证隧道
 
-在浏览器中访问以下地址确认隧道正常工作：
+访问：
 
-- **健康检查：** `https://<你的ngrok地址>/health` — 应返回 `{"status":"ok",...}`
-- **服务信息：** `https://<你的ngrok地址>/` — 应返回服务名称和工具列表
+```text
+https://<你的ngrok地址>/health
+```
 
-如果看到 ngrok 的警告页面（"Visit Site"），点击即可继续，这是免费版的正常行为。
+应返回：
 
-#### 4.7 保持 ngrok 运行
+```json
+{"status":"ok"}
+```
 
-> **注意：** ngrok 免费版每次重启隧道地址会变化。如果需要固定域名，可升级到付费版使用 `ngrok http 3100 --domain=your-domain.ngrok.app`。免费版下，每次重启 ngrok 后需要到 ChatGPT 更新连接器 URL。
+> ngrok 免费版每次重启隧道地址可能变化。地址变化后，需要同步更新 ChatGPT 中的 MCP Server URL。
 
----
+## 在 ChatGPT 中配置 MCP 应用
 
-### 5. 在 ChatGPT 中配置 MCP 应用
+1. 打开 ChatGPT 网页端。
+2. 进入 Settings。
+3. 开启 Developer mode。
+4. 创建自定义 MCP App / Connector。
+5. MCP Server URL 填写：
 
-ngrok 隧道启动后，将公网 HTTPS 地址配置到 ChatGPT 网页端。当前 ChatGPT 通过 **开发者模式 + 自定义应用（Custom App）** 来连接 MCP 服务器。
+```text
+https://<你的ngrok地址>/mcp
+```
 
-> **前提条件：** MCP 应用功能需要 ChatGPT 付费订阅（Plus / Team / Pro 等），免费版不可用。详见 [OpenAI 开发者模式文档](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)。
+例如：
 
-#### 5.1 确认 CORS 配置
+```text
+https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+```
 
-确保 `.env` 中的 `ALLOWED_ORIGINS` 包含 ChatGPT 的域名（**无需添加 ngrok 地址**，因为请求的 `Origin` 头来自浏览器中的 chatgpt.com）：
+> 关键点：必须以 `/mcp` 结尾，不要只填写 ngrok 根路径。
+
+### Authentication 设置
+
+如果 `.env` 中保持：
 
 ```env
-ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
+MCP_AUTH_TOKEN=
 ```
 
-修改后重启 MCP Server 使配置生效。
+则 ChatGPT 创建连接器时选择 `None` / 无认证。
 
-#### 5.2 开启开发者模式
+如果配置了：
 
-1. 打开 [ChatGPT 网页端](https://chatgpt.com) 并登录
-2. 点击左下角用户头像，打开 **Settings（设置）** 弹窗（也可直接访问 [chatgpt.com/#settings](https://chatgpt.com/#settings)）
-3. 滚动到设置页面**底部**，点击 **Advanced Settings（高级设置）**
-4. 将 **Developer mode（开发者模式）** 开关切换为**开启**
-
-#### 5.3 创建 MCP 应用
-
-1. 开启开发者模式后，在同一个设置弹窗中切换到 **Apps & Connectors（应用与连接器）** 选项卡
-2. 点击页面右上角的 **Create** 按钮
-3. 在弹出的表单中填写应用信息：
-
-| 字段 | 填写内容 |
-|------|----------|
-| **Name（名称）** | 自定义，如 `Code Repo MCP` |
-| **Description（描述）** | 可选，如 `Local code repository operations` |
-| **MCP Server URL** | `https://<你的ngrok地址>/mcp` |
-| **Authentication（认证）** | 选择 `None` |
-
-> **重要：** MCP Server URL 必须以 `/mcp` 结尾。例如 ngrok 转发地址为 `https://a1b2-203-0-113-1.ngrok-free.app`，则完整 URL 为 `https://a1b2-203-0-113-1.ngrok-free.app/mcp`。
-
-4. 勾选 **"I understand and want to continue"（我已了解并希望继续）** 复选框
-5. 点击 **Create** 创建应用
-
-#### 5.4 验证应用状态
-
-1. 返回 ChatGPT 主界面，顶部应显示 **Developer mode** 标识，表示 MCP 应用已启用
-2. 如果没有看到标识，刷新页面；若仍未出现，回到 **Advanced Settings** 确认开发者模式开关已打开
-3. 在 **Apps & Connectors** 选项卡中确认刚创建的应用状态为已启用
-
-#### 5.5 在对话中使用 MCP 工具
-
-1. 在 ChatGPT 聊天输入框中点击 **`+`** 按钮
-2. 选择 **More**
-3. 选择你创建的 **Code Repo MCP** 应用将其附加到当前对话
-4. 输入测试指令，例如：
-
-```
-列出我的项目根目录下的文件
+```env
+MCP_AUTH_TOKEN=your-secret-token
 ```
 
-ChatGPT 会调用 `list_directory` 工具并返回结果。首次工具调用时可能出现确认提示，点击允许即可（可勾选 "Remember for this conversation" 避免重复确认）。
+则 `/mcp` 会要求请求携带：
 
-> **提示：** 每个新对话都需要重新通过 **`+` → More → 选择应用** 来附加 MCP 连接器。
+```http
+Authorization: Bearer your-secret-token
+```
 
-你也可以在 **ngrok Web Interface**（`http://127.0.0.1:4040`）中查看实时请求日志，确认请求是否正常转发到本地服务。
+只有在 ChatGPT 连接器表单中也配置了对应认证时才应启用该项。否则连接器会因为 401 无法连接。
 
-#### 5.6 常见问题排查
+## 工具列表
 
-| 问题 | 原因 | 解决方案 |
-|------|------|----------|
-| 设置中没有 Advanced Settings | 未使用付费版 ChatGPT | 升级至 Plus / Team / Pro 等付费订阅 |
-| 设置中没有 Apps & Connectors | 开发者模式未开启 | 在 Advanced Settings 中开启 Developer mode |
-| 应用创建后连接失败 | ngrok 隧道未启动或地址已变 | 重启 ngrok，更新应用中的 MCP Server URL |
-| CORS 错误 | `ALLOWED_ORIGINS` 未包含 chatgpt 域名 | 添加 `https://chatgpt.com,https://chat.openai.com` 并重启服务 |
-| 工具调用报路径不在工作区 | `WORKSPACES` 未配置目标目录 | 在 `.env` 中添加目标目录路径 |
-| 对话中看不到 MCP 工具 | 未在当前对话附加应用 | 点击 **`+`** → **More** → 选择已创建的应用 |
-| 请求超时 | 本地服务未运行 / 端口不匹配 | 确认 MCP Server 在 3100 端口运行 |
-| ngrok 免费版拦截页面 | 免费版首次访问有警告页 | 在浏览器中先访问一次 ngrok 地址并点击 "Visit Site"，ChatGPT 端通常不受影响 |
+默认注册 20 个工具；当 `ENABLE_TERMINAL=true` 时额外注册 1 个高风险终端工具，总计 21 个。
 
-## 工具列表 (21 个 Tools)
+### 文件系统工具 (8 个)
 
-### 文件系统 (8 个)
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `list_directory` | 列出目录内容，递归最多展开 2 层 | `path`, `recursive?` | 只读 |
+| `read_file` | 读取文本文件，带行号，默认 500 行 | `path`, `startLine?`, `endLine?` | 只读，受 `MAX_READ_BYTES` 限制 |
+| `write_file` | 创建或覆盖文件 | `path`, `content` | 写入，destructive |
+| `edit_file` | 局部编辑，支持文本匹配和行号模式 | `path`, `edits[]` | 写入，受 `MAX_WRITE_BYTES` 限制 |
+| `delete_file` | 删除文件或目录 | `path`, `recursive?` | destructive，禁止删除工作区根目录 |
+| `create_directory` | 创建目录 | `path` | 写入，禁止直接操作工作区根目录 |
+| `move_file` | 移动或重命名文件/目录 | `source`, `destination` | destructive，禁止移动工作区根目录 |
+| `get_file_info` | 获取文件元信息 | `path` | 只读 |
 
-| Tool | 功能 | 关键参数 |
-|------|------|----------|
-| `list_directory` | 列出目录内容 | `path`, `recursive?` |
-| `read_file` | 读取文件 (带行号，默认500行) | `path`, `startLine?`, `endLine?` |
-| `write_file` | 创建/覆写文件 (自动建目录) | `path`, `content` |
-| `edit_file` | 局部编辑 (文本匹配 + 行号模式) | `path`, `edits[]` |
-| `delete_file` | 删除文件/目录 | `path`, `recursive?` |
-| `create_directory` | 创建目录 | `path` |
-| `move_file` | 移动/重命名 | `source`, `destination` |
-| `get_file_info` | 文件元信息 (大小/时间/权限) | `path` |
+### 搜索工具 (3 个)
 
-### 搜索 (3 个)
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `search_files` | glob 文件名搜索 | `pattern`, `basePath?`, `maxResults?` | 只读 |
+| `search_content` | 正则内容搜索，优先 ripgrep，失败时 fallback 到 Node.js 搜索 | `regex`, `path?`, `filePattern?`, `maxResults?` | 只读，跳过大文件和排除目录 |
+| `get_file_tree` | 输出目录树 | `path`, `maxDepth?`, `showHidden?` | 只读 |
 
-| Tool | 功能 | 关键参数 |
-|------|------|----------|
-| `search_files` | glob 文件名搜索 | `pattern`, `basePath?`, `maxResults?` |
-| `search_content` | 正则内容搜索 (优先 ripgrep) | `regex`, `path?`, `filePattern?`, `maxResults?` |
-| `get_file_tree` | 目录树结构 | `path`, `maxDepth?`, `showHidden?` |
+### Git 工具 (9 个)
 
-### Git (9 个)
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `git_status` | 查看仓库状态 | `repoPath` | 只读 |
+| `git_diff` | 查看 diff | `repoPath`, `staged?`, `filePath?` | 只读 |
+| `git_log` | 查看提交历史 | `repoPath`, `count?`, `filePath?` | 只读 |
+| `git_add` | 暂存文件 | `repoPath`, `files` | 写入 Git index |
+| `git_commit` | 创建本地提交 | `repoPath`, `message` | 写入本地 Git 历史 |
+| `git_branch` | 列出、创建、切换、删除分支 | `repoPath`, `action`, `branchName?` | 包含 destructive 动作 |
+| `git_show` | 查看 commit / ref 详情 | `repoPath`, `commitHash` | 只读 |
+| `git_push` | 推送到远程 | `repoPath`, `remote?`, `branch?`, `force?` | destructive，默认拒绝 force push |
+| `git_pull` | 拉取远程变更 | `repoPath`, `remote?`, `branch?`, `rebase?` | destructive，会修改工作区 |
 
-| Tool | 功能 | 关键参数 |
-|------|------|----------|
-| `git_status` | 仓库状态 | `repoPath` |
-| `git_diff` | 变更 diff | `repoPath`, `staged?`, `filePath?` |
-| `git_log` | 提交历史 | `repoPath`, `count?`, `filePath?` |
-| `git_add` | 暂存文件 | `repoPath`, `files` |
-| `git_commit` | 提交变更 | `repoPath`, `message` |
-| `git_branch` | 分支管理 (列出/创建/切换/删除) | `repoPath`, `action`, `branchName?` |
-| `git_show` | commit 详情 | `repoPath`, `commitHash` |
-| `git_push` | 推送到远程 | `repoPath`, `remote?`, `branch?`, `force?` |
-| `git_pull` | 拉取远程变更 | `repoPath`, `remote?`, `branch?`, `rebase?` |
+### 终端工具 (默认关闭)
 
-### 终端 (1 个)
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `run_command` | 执行 shell 命令 | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
 
-| Tool | 功能 | 关键参数 |
-|------|------|----------|
-| `run_command` | 执行 shell 命令 | `command`, `cwd`, `timeout?`, `env?` |
+启用方式：
+
+```env
+ENABLE_TERMINAL=true
+ALLOWED_COMMAND_PREFIXES=npm run build,npm test,git status
+ALLOW_ANY_COMMAND=false
+```
+
+默认只允许 `ALLOWED_COMMAND_PREFIXES` 中配置的命令前缀。只有设置 `ALLOW_ANY_COMMAND=true` 才允许任意命令。
+
+> 不建议在公网 ngrok 环境中设置 `ALLOW_ANY_COMMAND=true`。
 
 ## 安全机制
 
-### 路径白名单
+### 工作区白名单
 
-所有文件操作必须在 `WORKSPACES` 配置的目录内，越权访问会被拒绝：
+所有文件、搜索、Git、命令执行的工作目录都必须位于 `WORKSPACES` 配置的目录内。
 
+```text
+路径 "C:\Users\admin\.ssh" 不在允许的工作区目录内。
+允许的工作区: D:\CodeX\chatgpt-local-repo-bridge-mcp, D:\CodeX\mindx-agent
 ```
-路径 "/etc/passwd" 不在允许的工作区目录内。
-允许的工作区: /Users/xuliugen/Dev/Code
+
+### realpath / symlink 防护
+
+路径校验使用 `realpath`，用于防止工作区内的符号链接指向工作区外部目录，从而绕过白名单。
+
+### 排除目录
+
+`EXCLUDED_DIRS` 中的目录名在任意层级都会被拦截或跳过：
+
+- 直接访问：`read_file("/path/node_modules/xxx")` 会报错
+- 目录遍历：`list_directory` / `get_file_tree` 会跳过
+- 搜索：`search_content` / `search_files` 会忽略
+
+建议始终排除：
+
+```text
+node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,.qoder
 ```
 
-### 目录排除
+### 禁止直接操作工作区根目录
 
-`EXCLUDED_DIRS` 中的目录名在**任意层级**都会被拦截：
+以下工具会拒绝直接作用于 `WORKSPACES` 根目录：
 
-- **直接访问**：`read_file("/path/node_modules/xxx")` → 报错
-- **目录遍历**：`list_directory` / `get_file_tree` 自动跳过
-- **搜索过滤**：`search_content` / `search_files` 自动忽略
+- `write_file`
+- `edit_file`
+- `delete_file`
+- `create_directory`
+- `move_file`
 
-### CORS 限制
+主要用于避免误删或覆盖整个项目目录。
 
-仅允许 `ALLOWED_ORIGINS` 中配置的域名发起跨域请求。
+### 文件大小限制
+
+```env
+MAX_READ_BYTES=1048576
+MAX_WRITE_BYTES=2097152
+```
+
+`read_file` / `edit_file` 会拒绝读取超出 `MAX_READ_BYTES` 的文件。`write_file` / `edit_file` 会拒绝写入超出 `MAX_WRITE_BYTES` 的内容。
+
+### 可选认证
+
+`MCP_AUTH_TOKEN` 为空时，`/mcp` 不做 Bearer Token 校验。
+
+`MCP_AUTH_TOKEN` 非空时，`/mcp` 要求：
+
+```http
+Authorization: Bearer <MCP_AUTH_TOKEN>
+```
+
+CORS 不是鉴权，不能阻止 curl、脚本或其他服务端请求直接访问公网 MCP 地址。公网暴露时建议配置认证或只短时间开启 ngrok。
+
+### Session TTL 与限流
+
+```env
+MAX_SESSIONS=25
+SESSION_TTL_MS=1800000
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=120
+```
+
+这些配置用于限制 active MCP sessions 数量、清理空闲 session，并对 `/mcp` 做简单请求限流。
+
+### 公共信息暴露
+
+默认：
+
+```env
+EXPOSE_PUBLIC_INFO=false
+```
+
+此时：
+
+- `/health` 只返回 `{"status":"ok"}`
+- `/` 只返回最小服务信息
+
+若设置为 `true`，会公开工具清单、认证是否启用、终端工具是否启用、active sessions 等调试信息。
 
 ## 项目结构
 
-```
+```text
 src/
-├── index.ts              # 入口：启动 HTTP 服务
-├── server.ts             # MCP Server 创建与 Tool 注册
-├── transport.ts          # Streamable HTTP 传输层 (Express)
-├── config.ts             # 配置管理 (.env 加载)
+├── index.ts                    # 入口：启动 HTTP 服务
+├── server.ts                   # MCP Server 创建与 Tool 注册
+├── transport.ts                # Streamable HTTP 传输层、鉴权、限流、session 管理
+├── config.ts                   # 配置管理 (.env 加载)
 ├── tools/
-│   ├── filesystem.ts     # 文件系统工具 (8)
-│   ├── search.ts         # 搜索工具 (3)，支持 ripgrep
-│   ├── git.ts            # Git 工具 (9)
-│   └── terminal.ts       # 终端工具 (1)
+│   ├── filesystem.ts           # 文件系统工具 (8)
+│   ├── search.ts               # 搜索工具 (3)，支持 ripgrep + Node fallback
+│   ├── git.ts                  # Git 工具 (9)
+│   └── terminal.ts             # 终端工具 (1，默认不注册)
 └── utils/
-    ├── path-guard.ts     # 路径安全校验 + 目录排除
-    └── logger.ts         # 日志工具
+    ├── logger.ts               # 日志工具
+    ├── path-guard.ts           # 路径安全校验、realpath、目录排除
+    └── tool-annotations.ts     # MCP tool annotations 统一定义
 ```
+
+## API 端点
+
+| 端点 | 方法 | 说明 | 是否受 `MCP_AUTH_TOKEN` 保护 |
+|------|------|------|------------------------------|
+| `/mcp` | POST | MCP 初始化和工具调用 | 是 |
+| `/mcp` | GET | SSE 流 / 服务端通知 | 是 |
+| `/mcp` | DELETE | 终止 MCP session | 是 |
+| `/health` | GET | 健康检查 | 否 |
+| `/` | GET | 服务信息 | 否 |
+
+## 典型工作流
+
+默认安全模式下，ChatGPT 可以完成读取、编辑、搜索和 Git 操作，但不会执行 shell 命令：
+
+```text
+用户: 帮我检查这个项目的 TypeScript 入口和路由结构
+
+ChatGPT 可能调用:
+1. get_file_tree(".")
+2. search_content("createApp|express|router", path=".", filePattern="src/**/*.ts")
+3. read_file("src/index.ts")
+4. read_file("src/transport.ts")
+5. git_diff(repoPath=".")
+```
+
+启用 `ENABLE_TERMINAL=true` 后，可允许有限命令：
+
+```text
+ALLOWED_COMMAND_PREFIXES=npm run build,npm test,git status
+```
+
+此时 ChatGPT 可调用：
+
+```text
+run_command("npm run build", cwd=".")
+run_command("npm test", cwd=".")
+```
+
+## 常见问题排查
+
+| 问题 | 常见原因 | 处理方式 |
+|------|----------|----------|
+| 创建连接器时报 `Something went wrong` | URL 不是 `/mcp`、ngrok 未运行、tool schema/annotations 不合法、认证不匹配 | 确认 URL 为 `https://<ngrok>/mcp`，重启服务，查看本地日志和 ngrok 请求日志 |
+| `/health` 能访问，但 ChatGPT 连接失败 | `/mcp` 被认证拦截或 MCP 初始化失败 | 若 ChatGPT 未配置认证，先保持 `MCP_AUTH_TOKEN=` 为空 |
+| 工具数量从 21 变成 20 | `ENABLE_TERMINAL=false` | 这是默认安全行为；需要终端工具时显式开启 |
+| `run_command` 不存在 | 终端工具默认未注册 | 设置 `ENABLE_TERMINAL=true` 并重启服务 |
+| `run_command` 被拒绝 | 命令前缀不在 `ALLOWED_COMMAND_PREFIXES` 中 | 添加允许前缀，或仅在可信环境设置 `ALLOW_ANY_COMMAND=true` |
+| 路径不在工作区 | `WORKSPACES` 未包含目标目录，或 symlink 指向外部 | 修改 `WORKSPACES` 后重启服务，避免依赖外部 symlink |
+| 读取文件被拒绝 | 文件超过 `MAX_READ_BYTES` 或不是普通文件 | 调整限制或改为读取更小文件 |
+| `git_push --force` 被拒绝 | 默认禁止 force push | 需要时设置 `ALLOW_GIT_FORCE_PUSH=true`，谨慎使用 |
+| 搜索速度慢 | 未安装 ripgrep，使用 Node fallback | 安装 ripgrep |
+
+## ripgrep 可选优化
+
+安装 ripgrep 可以显著提升大仓库搜索性能。未安装时，`search_content` 会自动降级到 Node.js 内置搜索。
+
+macOS：
+
+```bash
+brew install ripgrep
+```
+
+Ubuntu / Debian：
+
+```bash
+sudo apt install ripgrep
+```
+
+Windows：
+
+```powershell
+winget install BurntSushi.ripgrep.MSVC
+```
+
+## 安全建议
+
+- 不要长期公开 ngrok 地址。
+- 不要把 `WORKSPACES` 指到用户主目录、磁盘根目录或包含密钥的目录。
+- 不要在公网环境启用 `ALLOW_ANY_COMMAND=true`。
+- 不要在公网环境启用 `EXPOSE_PUBLIC_INFO=true`。
+- 如果启用 `MCP_AUTH_TOKEN`，不要把 token 提交到 Git。
+- `.env` 已被 `.gitignore` 忽略，请继续保持。
+- Git push / pull / branch delete 属于高风险操作，使用前先查看 `git_status` 和 `git_diff`。
 
 ## 技术栈
 
@@ -338,51 +469,12 @@ src/
 |------|------|
 | 语言 | TypeScript |
 | 运行时 | Node.js >= 18 |
-| MCP SDK | @modelcontextprotocol/sdk |
+| MCP SDK | `@modelcontextprotocol/sdk` |
 | 传输协议 | Streamable HTTP |
 | Web 框架 | Express |
 | Git 操作 | simple-git |
-| 搜索加速 | ripgrep (可选，自动降级) |
+| 搜索加速 | ripgrep 可选 |
 | Schema | Zod v4 |
-
-## 典型 AI Coding 工作流
-
-```
-用户: "帮我在 my-app 项目里加一个用户注册功能"
-
-ChatGPT 自动执行:
- 1. get_file_tree("/path/to/my-app")           → 了解项目结构
- 2. search_content("router|app\\.use", ...)    → 找到路由入口
- 3. read_file("src/routes/index.ts")           → 读路由文件
- 4. write_file("src/routes/auth.ts", ...)      → 创建注册路由
- 5. edit_file("src/routes/index.ts", [...])    → 注册新路由
- 6. run_command("npm run build", ...)          → 编译检查
- 7. run_command("npm test", ...)               → 跑测试
- 8. git_diff(repoPath=...)                     → 查看变更
- 9. git_add + git_commit                       → 提交代码
-10. git_push                                   → 推送到远程
-```
-
-## API 端点
-
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/mcp` | POST | MCP 协议主端点 (初始化 + 调用) |
-| `/mcp` | GET | SSE 流 (服务端通知) |
-| `/mcp` | DELETE | 终止会话 |
-| `/health` | GET | 健康检查 |
-| `/` | GET | 服务信息 + 工具列表 |
-
-## 优化建议
-
-安装 [ripgrep](https://github.com/BurntSushi/ripgrep) 可显著提升大仓库的代码搜索性能：
-
-```bash
-brew install ripgrep    # macOS
-apt install ripgrep     # Ubuntu/Debian
-```
-
-`search_content` 工具会自动检测 ripgrep 是否可用，不可用时降级为 Node.js 内置搜索。
 
 ## License
 

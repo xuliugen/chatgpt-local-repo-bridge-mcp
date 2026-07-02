@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { exec } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -9,8 +9,21 @@ import { assertPathAllowed, resolvePath, isDirExcluded } from '../utils/path-gua
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { glob } from 'glob';
+import { readOnlyLocalTool } from '../utils/tool-annotations.js';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+function normalizeLimit(maxResults: number | undefined, defaultValue: number, maxValue: number): number {
+  const value = maxResults ?? defaultValue;
+  if (!Number.isFinite(value)) return defaultValue;
+  return Math.min(Math.max(Math.floor(value), 1), maxValue);
+}
+
+function validateSearchPattern(pattern: string): string | null {
+  if (!pattern.trim()) return '搜索正则不能为空';
+  if (pattern.length > 500) return '搜索正则过长，已拒绝';
+  return null;
+}
 
 /**
  * 尝试使用 ripgrep 搜索 (高性能)
@@ -22,41 +35,35 @@ async function tryRipgrep(
   filePattern: string | undefined,
   limit: number
 ): Promise<CallToolResult | null> {
+  const args = [
+    '--no-heading',
+    '--line-number',
+    '--max-count', String(limit),
+    ...config.excludedDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
+  ];
+
+  if (filePattern) {
+    args.push('--glob', filePattern);
+  }
+
+  args.push('--', pattern, base);
+
   try {
-    // 构建 rg 命令
-    const args = [
-      'rg',
-      '--no-heading',
-      '--line-number',
-      '--max-count', String(limit),
-      // 使用配置中的排除目录
-      ...config.excludedDirs.flatMap((d) => ['--glob', `!${d}`]),
-    ];
-
-    if (filePattern) {
-      args.push('--glob', filePattern);
-    }
-
-    // 用 shell 转义保护 pattern
-    args.push('--', JSON.stringify(pattern));
-    args.push(JSON.stringify(base));
-
-    const command = args.join(' ');
-    const { stdout } = await execAsync(command, {
+    const { stdout } = await execFileAsync('rg', args, {
       cwd: base,
       timeout: 15000,
       maxBuffer: 5 * 1024 * 1024,
+      windowsHide: true,
     });
 
     const matches = stdout.trim().split('\n').filter(Boolean);
     const lines = matches.map((line) => {
-      // rg 输出格式: file:line:content
       const relativeLine = line.startsWith(base) ? path.relative(base, line) : line;
       return relativeLine;
     });
 
     const output = [
-      `[搜索引擎: ripgrep]`,
+      '[搜索引擎: ripgrep]',
       `搜索正则: ${pattern}`,
       `搜索目录: ${base}`,
       `文件过滤: ${filePattern || '(所有文件)'}`,
@@ -69,13 +76,10 @@ async function tryRipgrep(
       content: [{ type: 'text', text: output.join('\n') }],
     };
   } catch (error) {
-    const errMsg = (error as Error).message || '';
-    // ENOENT 或 command not found 表示 rg 未安装
-    if (errMsg.includes('ENOENT') || errMsg.includes('not found') || errMsg.includes('ENOENT')) {
-      return null;
-    }
-    // rg 返回退出码 1 表示没有匹配结果 (不是错误)
-    if (errMsg.includes('Command failed')) {
+    const execError = error as Error & { code?: unknown; stdout?: string };
+
+    // ripgrep 退出码 1 表示没有匹配结果。
+    if (execError.code === 1) {
       return {
         content: [{
           type: 'text',
@@ -83,6 +87,13 @@ async function tryRipgrep(
         }],
       };
     }
+
+    // Windows / macOS / Linux 下命令不存在都交给 Node fallback。
+    if (execError.code === 'ENOENT') {
+      return null;
+    }
+
+    logger.warn(`ripgrep 执行失败，降级为 Node.js 搜索: ${execError.message}`);
     return null;
   }
 }
@@ -120,8 +131,9 @@ async function nodeFallbackSearch(
   for (const file of files) {
     if (matchCount >= limit) break;
     try {
+      assertPathAllowed(file);
       const stats = await fs.stat(file);
-      if (stats.size > 1024 * 1024) continue;
+      if (!stats.isFile() || stats.size > Math.min(config.maxReadBytes, 1024 * 1024)) continue;
 
       const content = await fs.readFile(file, 'utf-8');
       const fileLines = content.split('\n');
@@ -136,12 +148,13 @@ async function nodeFallbackSearch(
         }
       }
     } catch {
-      // 跳过无法读取的文件
+      // 跳过无法读取或越权的文件
     }
   }
 
   const output = [
-    `[搜索引擎: Node.js 内置 (建议安装 ripgrep 提升性能: brew install ripgrep)]`,
+    '[搜索引擎: Node.js 内置]',
+    '提示: 安装 ripgrep 可提升大仓库搜索性能。',
     `搜索正则: ${pattern}`,
     `搜索目录: ${base}`,
     `文件过滤: ${filePattern || '(所有文件)'}`,
@@ -165,10 +178,11 @@ export function registerSearchTools(server: McpServer): void {
     {
       title: 'Search Files',
       description: '按文件名模式搜索文件，支持 glob 通配符 (如 *.ts, **/*.js)。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
-        pattern: z.string().describe('文件名搜索模式 (glob 通配符)，例如: *.ts, **/*.tsx, src/**/*.go'),
+        pattern: z.string().min(1).max(300).describe('文件名搜索模式 (glob 通配符)，例如: *.ts, **/*.tsx, src/**/*.go'),
         basePath: z.string().optional().describe('搜索的根目录路径，默认为工作区根目录'),
-        maxResults: z.number().optional().describe('最大结果数量，默认为 100'),
+        maxResults: z.number().int().positive().optional().describe('最大结果数量，默认为 100，最高 500'),
       },
     },
     async ({ pattern, basePath, maxResults }): Promise<CallToolResult> => {
@@ -184,8 +198,15 @@ export function registerSearchTools(server: McpServer): void {
         ignore: config.excludedDirs.map((d) => `**/${d}/**`),
       });
 
-      const limit = maxResults ?? 100;
-      const results = files.slice(0, limit);
+      const limit = normalizeLimit(maxResults, 100, 500);
+      const results = files.slice(0, limit).filter((file) => {
+        try {
+          assertPathAllowed(file);
+          return true;
+        } catch {
+          return false;
+        }
+      });
 
       const output = [
         `搜索模式: ${pattern}`,
@@ -206,29 +227,36 @@ export function registerSearchTools(server: McpServer): void {
     'search_content',
     {
       title: 'Search Content',
-      description: '在文件内容中搜索正则表达式匹配。优先使用 ripgrep (rg) 实现高性能搜索，若未安装则降级为 Node.js 内置搜索。返回匹配的文件和行号。',
+      description: '在文件内容中搜索正则表达式匹配。优先使用 ripgrep，若未安装则降级为 Node.js 内置搜索。返回匹配的文件和行号。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
-        regex: z.string().describe('搜索的正则表达式'),
+        regex: z.string().min(1).max(500).describe('搜索的正则表达式'),
         path: z.string().optional().describe('搜索的目录路径，默认为工作区根目录'),
-        filePattern: z.string().optional().describe('限定搜索的文件类型 (glob)，如 *.ts, *.go'),
-        maxResults: z.number().optional().describe('最大结果数量，默认为 50'),
+        filePattern: z.string().max(300).optional().describe('限定搜索的文件类型 (glob)，如 *.ts, *.go'),
+        maxResults: z.number().int().positive().optional().describe('最大结果数量，默认为 50，最高 500'),
       },
     },
     async ({ regex: pattern, path: searchPath, filePattern, maxResults }): Promise<CallToolResult> => {
+      const validationError = validateSearchPattern(pattern);
+      if (validationError) {
+        return {
+          content: [{ type: 'text', text: validationError }],
+          isError: true,
+        };
+      }
+
       const base = resolvePath(searchPath || '.');
       assertPathAllowed(base);
 
       logger.info(`search_content: regex="${pattern}" base="${base}" filePattern="${filePattern}"`);
 
-      const limit = maxResults ?? 50;
+      const limit = normalizeLimit(maxResults, 50, 500);
 
-      // 优先尝试 ripgrep
       const rgResult = await tryRipgrep(pattern, base, filePattern, limit);
       if (rgResult !== null) {
         return rgResult;
       }
 
-      // 降级为 Node.js 内置搜索
       logger.info('ripgrep 不可用，降级为 Node.js 内置搜索');
       return await nodeFallbackSearch(pattern, base, filePattern, limit);
     }
@@ -240,9 +268,10 @@ export function registerSearchTools(server: McpServer): void {
     {
       title: 'Get File Tree',
       description: '获取目录的树形结构，类似 tree 命令。用于了解项目结构。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
         path: z.string().describe('目录路径'),
-        maxDepth: z.number().optional().describe('最大递归深度，默认为 3'),
+        maxDepth: z.number().int().positive().max(10).optional().describe('最大递归深度，默认为 3，最高 10'),
         showHidden: z.boolean().optional().describe('是否显示隐藏文件 (以.开头的)，默认为 false'),
       },
     },
@@ -279,15 +308,12 @@ async function buildTree(
     return '';
   }
 
-  // 过滤隐藏文件
   if (!showHidden) {
     entries = entries.filter((e) => !e.name.startsWith('.'));
   }
 
-  // 使用配置中的排除目录
   entries = entries.filter((e) => !isDirExcluded(e.name));
 
-  // 排序
   const sorted = entries.sort((a, b) => {
     if (a.isDirectory() && !b.isDirectory()) return -1;
     if (!a.isDirectory() && b.isDirectory()) return 1;
@@ -306,14 +332,15 @@ async function buildTree(
     lines.push(`${indent}${prefix}${name}`);
 
     if (entry.isDirectory()) {
-      const subTree = await buildTree(
-        path.join(dirPath, entry.name),
-        maxDepth,
-        currentDepth + 1,
-        showHidden
-      );
-      if (subTree) {
-        lines.push(subTree);
+      const subDir = path.join(dirPath, entry.name);
+      try {
+        assertPathAllowed(subDir);
+        const subTree = await buildTree(subDir, maxDepth, currentDepth + 1, showHidden);
+        if (subTree) {
+          lines.push(subTree);
+        }
+      } catch {
+        lines.push(`${indent}│   [权限不足，跳过]`);
       }
     }
   }

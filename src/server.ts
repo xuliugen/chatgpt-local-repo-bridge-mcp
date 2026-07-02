@@ -3,6 +3,7 @@ import { registerFilesystemTools } from './tools/filesystem.js';
 import { registerSearchTools } from './tools/search.js';
 import { registerGitTools } from './tools/git.js';
 import { registerTerminalTools } from './tools/terminal.js';
+import { config } from './config.js';
 import { logger } from './utils/logger.js';
 
 /**
@@ -24,23 +25,23 @@ export function createMcpServer(): McpServer {
 
   logger.info('正在注册 MCP Tools...');
 
-  // 注册文件系统工具
   registerFilesystemTools(server);
   logger.info('  - 文件系统工具 (8 个 Tools)');
 
-  // 注册搜索工具
   registerSearchTools(server);
   logger.info('  - 搜索工具 (3 个 Tools)');
 
-  // 注册 Git 工具
   registerGitTools(server);
   logger.info('  - Git 工具 (9 个 Tools)');
 
-  // 注册终端工具
-  registerTerminalTools(server);
-  logger.info('  - 终端工具 (1 个 Tool)');
+  if (config.enableTerminal) {
+    registerTerminalTools(server);
+    logger.warn('  - 终端工具 (1 个 Tool，已启用高风险命令执行能力)');
+  } else {
+    logger.info('  - 终端工具已禁用 (ENABLE_TERMINAL=false)');
+  }
 
-  logger.info('共注册 21 个 MCP Tools');
+  logger.info(`共注册 ${config.enableTerminal ? 21 : 20} 个 MCP Tools`);
 
   return server;
 }

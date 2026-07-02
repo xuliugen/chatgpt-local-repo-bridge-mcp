@@ -1,15 +1,47 @@
+import path from 'node:path';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { simpleGit, SimpleGit } from 'simple-git';
 import { assertPathAllowed, resolvePath } from '../utils/path-guard.js';
 import { logger } from '../utils/logger.js';
+import { config } from '../config.js';
+import { destructiveLocalTool, readOnlyLocalTool, writeLocalTool } from '../utils/tool-annotations.js';
 
 /**
  * 获取 Git 实例
  */
 function getGit(repoPath: string): SimpleGit {
   return simpleGit(repoPath);
+}
+
+function assertSafeRelativeGitPath(filePath: string): void {
+  if (!filePath || filePath === '.') return;
+  if (path.isAbsolute(filePath)) {
+    throw new Error(`Git 文件路径必须是仓库内相对路径: ${filePath}`);
+  }
+  const normalized = path.normalize(filePath);
+  if (normalized === '..' || normalized.startsWith(`..${path.sep}`) || normalized.includes(`${path.sep}..${path.sep}`)) {
+    throw new Error(`Git 文件路径不能跳出仓库: ${filePath}`);
+  }
+  if (normalized.startsWith('-')) {
+    throw new Error(`Git 文件路径不能以 '-' 开头: ${filePath}`);
+  }
+}
+
+function assertSafeGitRef(ref: string, label: string): void {
+  if (!ref || ref.length > 200) {
+    throw new Error(`${label} 无效或过长`);
+  }
+  if (ref.startsWith('-') || /[\u0000-\u001f\s]/.test(ref)) {
+    throw new Error(`${label} 包含不安全字符: ${ref}`);
+  }
+}
+
+function assertSafeRemote(remote: string): void {
+  if (!/^[A-Za-z0-9_.-]{1,100}$/.test(remote)) {
+    throw new Error(`远程仓库名包含不安全字符: ${remote}`);
+  }
 }
 
 /**
@@ -22,6 +54,7 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Status',
       description: '查看 Git 仓库的当前状态，包括暂存区、未暂存的变更和未跟踪的文件。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
       },
@@ -70,15 +103,17 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Diff',
       description: '查看文件的变更内容 (diff)。可以查看暂存区或工作区的变更。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         staged: z.boolean().optional().describe('是否查看暂存区的变更，默认为 false (工作区)'),
-        filePath: z.string().optional().describe('限定查看某个文件的 diff'),
+        filePath: z.string().optional().describe('限定查看某个文件的 diff，必须是仓库内相对路径'),
       },
     },
     async ({ repoPath, staged, filePath }): Promise<CallToolResult> => {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
+      if (filePath) assertSafeRelativeGitPath(filePath);
 
       logger.info(`git_diff: ${resolved} (staged=${staged}, file=${filePath})`);
 
@@ -112,15 +147,17 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Log',
       description: '查看 Git 提交历史。',
+      annotations: readOnlyLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
-        count: z.number().optional().describe('显示的提交数量，默认为 10'),
-        filePath: z.string().optional().describe('限定查看某个文件的提交历史'),
+        count: z.number().int().positive().max(100).optional().describe('显示的提交数量，默认为 10，最高 100'),
+        filePath: z.string().optional().describe('限定查看某个文件的提交历史，必须是仓库内相对路径'),
       },
     },
     async ({ repoPath, count, filePath }): Promise<CallToolResult> => {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
+      if (filePath) assertSafeRelativeGitPath(filePath);
 
       logger.info(`git_log: ${resolved} (count=${count}, file=${filePath})`);
 
@@ -158,14 +195,11 @@ export function registerGitTools(server: McpServer): void {
     'git_add',
     {
       title: 'Git Add',
-      description: '将文件添加到 Git 暂存区。',
-      annotations: {
-        title: 'Git Add',
-        readOnlyHint: false,
-      },
+      description: '将文件添加到 Git 暂存区。文件路径必须是仓库内相对路径；允许使用 "." 暂存全部变更。',
+      annotations: writeLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
-        files: z.union([z.string(), z.array(z.string())]).describe('要暂存的文件路径，可以是文件路径字符串或字符串数组，也可以用 "." 暂存所有变更'),
+        files: z.union([z.string(), z.array(z.string()).min(1).max(100)]).describe('要暂存的文件路径，可以是文件路径字符串或字符串数组，也可以用 "." 暂存所有变更'),
       },
     },
     async ({ repoPath, files }): Promise<CallToolResult> => {
@@ -173,6 +207,8 @@ export function registerGitTools(server: McpServer): void {
       assertPathAllowed(resolved);
 
       const filesArray = Array.isArray(files) ? files : [files];
+      filesArray.forEach(assertSafeRelativeGitPath);
+
       logger.info(`git_add: ${resolved} files=${filesArray.join(', ')}`);
 
       const git = getGit(resolved);
@@ -190,21 +226,17 @@ export function registerGitTools(server: McpServer): void {
     {
       title: 'Git Commit',
       description: '提交暂存区的变更到本地仓库。',
-      annotations: {
-        title: 'Git Commit',
-        destructiveHint: false,
-        readOnlyHint: false,
-      },
+      annotations: writeLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
-        message: z.string().describe('提交信息'),
+        message: z.string().min(1).max(500).describe('提交信息'),
       },
     },
     async ({ repoPath, message }): Promise<CallToolResult> => {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
 
-      logger.warn(`git_commit: ${resolved} message="${message}"`);
+      logger.warn(`git_commit: ${resolved} messageLength=${message.length}`);
 
       const git = getGit(resolved);
       const result = await git.commit(message);
@@ -225,7 +257,8 @@ export function registerGitTools(server: McpServer): void {
     'git_branch',
     {
       title: 'Git Branch',
-      description: '管理 Git 分支：列出分支、创建新分支或切换分支。',
+      description: '管理 Git 分支：列出分支、创建新分支、切换分支或删除分支。由于包含删除动作，此工具标记为 destructive。',
+      annotations: destructiveLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         action: z.enum(['list', 'create', 'switch', 'delete']).describe('操作类型: list(列出), create(创建), switch(切换), delete(删除)'),
@@ -235,6 +268,16 @@ export function registerGitTools(server: McpServer): void {
     async ({ repoPath, action, branchName }): Promise<CallToolResult> => {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
+
+      if (action !== 'list') {
+        if (!branchName) {
+          return {
+            content: [{ type: 'text', text: `${action} 分支需要提供 branchName 参数` }],
+            isError: true,
+          };
+        }
+        assertSafeGitRef(branchName, '分支名称');
+      }
 
       logger.info(`git_branch: ${resolved} action=${action} branch=${branchName}`);
 
@@ -252,39 +295,21 @@ export function registerGitTools(server: McpServer): void {
         }
 
         case 'create': {
-          if (!branchName) {
-            return {
-              content: [{ type: 'text', text: '创建分支需要提供 branchName 参数' }],
-              isError: true,
-            };
-          }
-          await git.checkoutLocalBranch(branchName);
+          await git.checkoutLocalBranch(branchName!);
           return {
             content: [{ type: 'text', text: `已创建并切换到新分支: ${branchName}` }],
           };
         }
 
         case 'switch': {
-          if (!branchName) {
-            return {
-              content: [{ type: 'text', text: '切换分支需要提供 branchName 参数' }],
-              isError: true,
-            };
-          }
-          await git.checkout(branchName);
+          await git.checkout(branchName!);
           return {
             content: [{ type: 'text', text: `已切换到分支: ${branchName}` }],
           };
         }
 
         case 'delete': {
-          if (!branchName) {
-            return {
-              content: [{ type: 'text', text: '删除分支需要提供 branchName 参数' }],
-              isError: true,
-            };
-          }
-          await git.deleteLocalBranch(branchName);
+          await git.deleteLocalBranch(branchName!);
           return {
             content: [{ type: 'text', text: `已删除分支: ${branchName}` }],
           };
@@ -293,34 +318,68 @@ export function registerGitTools(server: McpServer): void {
     }
   );
 
+  // 7. git_show - 查看 commit 详情
+  server.registerTool(
+    'git_show',
+    {
+      title: 'Git Show',
+      description: '查看指定提交的详细信息，包括提交消息和变更内容。',
+      annotations: readOnlyLocalTool,
+      inputSchema: {
+        repoPath: z.string().describe('Git 仓库的路径'),
+        commitHash: z.string().min(1).max(200).describe('提交的哈希值或安全 ref (可以是完整哈希、简写或 HEAD~1)'),
+      },
+    },
+    async ({ repoPath, commitHash }): Promise<CallToolResult> => {
+      const resolved = resolvePath(repoPath);
+      assertPathAllowed(resolved);
+      assertSafeGitRef(commitHash, '提交引用');
+
+      logger.info(`git_show: ${resolved} commit=${commitHash}`);
+
+      const git = getGit(resolved);
+      const output = await git.raw(['show', commitHash]);
+
+      return {
+        content: [{ type: 'text', text: output }],
+      };
+    }
+  );
+
   // 8. git_push - 推送到远程
   server.registerTool(
     'git_push',
     {
       title: 'Git Push',
-      description: '将本地提交推送到远程仓库。支持指定远程名和分支，也支持 force push。',
-      annotations: {
-        title: 'Git Push',
-        destructiveHint: true,
-        readOnlyHint: false,
-      },
+      description: '将本地提交推送到远程仓库。默认禁止 force push，可通过 ALLOW_GIT_FORCE_PUSH=true 显式启用。',
+      annotations: destructiveLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         remote: z.string().optional().describe('远程仓库名，默认为 origin'),
         branch: z.string().optional().describe('远程分支名，默认为当前分支'),
-        force: z.boolean().optional().describe('是否强制推送 (慎用)，默认为 false'),
+        force: z.boolean().optional().describe('是否强制推送 (慎用)，默认为 false，且需要 ALLOW_GIT_FORCE_PUSH=true'),
       },
     },
     async ({ repoPath, remote, branch, force }): Promise<CallToolResult> => {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
 
-      logger.warn(`git_push: ${resolved} remote=${remote ?? 'origin'} branch=${branch ?? '(current)'} force=${force}`);
+      const remoteName = remote ?? 'origin';
+      assertSafeRemote(remoteName);
+      if (branch) assertSafeGitRef(branch, '远程分支名');
+
+      if (force && !config.allowGitForcePush) {
+        return {
+          content: [{ type: 'text', text: '已拒绝 force push。若确实需要，请设置 ALLOW_GIT_FORCE_PUSH=true 后重启服务。' }],
+          isError: true,
+        };
+      }
+
+      logger.warn(`git_push: ${resolved} remote=${remoteName} branch=${branch ?? '(current)'} force=${force}`);
 
       const git = getGit(resolved);
 
       try {
-        const remoteName = remote ?? 'origin';
         if (branch) {
           await git.push(remoteName, branch, force ? ['--force'] : []);
         } else {
@@ -344,7 +403,8 @@ export function registerGitTools(server: McpServer): void {
     'git_pull',
     {
       title: 'Git Pull',
-      description: '从远程仓库拉取变更并合并到当前分支。',
+      description: '从远程仓库拉取变更并合并到当前分支。会修改工作区，因此标记为 destructive。',
+      annotations: destructiveLocalTool,
       inputSchema: {
         repoPath: z.string().describe('Git 仓库的路径'),
         remote: z.string().optional().describe('远程仓库名，默认为 origin'),
@@ -356,12 +416,15 @@ export function registerGitTools(server: McpServer): void {
       const resolved = resolvePath(repoPath);
       assertPathAllowed(resolved);
 
-      logger.info(`git_pull: ${resolved} remote=${remote ?? 'origin'} branch=${branch ?? '(current)'} rebase=${rebase}`);
+      const remoteName = remote ?? 'origin';
+      assertSafeRemote(remoteName);
+      if (branch) assertSafeGitRef(branch, '远程分支名');
+
+      logger.info(`git_pull: ${resolved} remote=${remoteName} branch=${branch ?? '(current)'} rebase=${rebase}`);
 
       const git = getGit(resolved);
 
       try {
-        const remoteName = remote ?? 'origin';
         const result = await git.pull(remoteName, branch, rebase ? ['--rebase'] : []);
 
         return {
@@ -378,33 +441,4 @@ export function registerGitTools(server: McpServer): void {
       }
     }
   );
-
-  // 7. git_show - 查看 commit 详情
-  server.registerTool(
-    'git_show',
-    {
-      title: 'Git Show',
-      description: '查看指定提交的详细信息，包括提交消息和变更内容。',
-      inputSchema: {
-        repoPath: z.string().describe('Git 仓库的路径'),
-        commitHash: z.string().describe('提交的哈希值 (可以是完整哈希或简写)'),
-      },
-    },
-    async ({ repoPath, commitHash }): Promise<CallToolResult> => {
-      const resolved = resolvePath(repoPath);
-      assertPathAllowed(resolved);
-
-      logger.info(`git_show: ${resolved} commit=${commitHash}`);
-
-      const git = getGit(resolved);
-
-      // 使用 raw 命令获取 show 输出
-      const output = await git.raw(['show', commitHash]);
-
-      return {
-        content: [{ type: 'text', text: output }],
-      };
-    }
-  );
 }
-

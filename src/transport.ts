@@ -1,22 +1,50 @@
 import express from 'express';
 import cors from 'cors';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createMcpServer } from './server.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 
+interface SessionRecord {
+  transport: StreamableHTTPServerTransport;
+  lastSeen: number;
+}
+
+interface RateLimitRecord {
+  windowStartedAt: number;
+  count: number;
+}
+
+function isAuthorized(req: express.Request): boolean {
+  if (!config.authToken) return true;
+
+  const authorization = req.headers.authorization;
+  if (!authorization?.startsWith('Bearer ')) return false;
+
+  const suppliedToken = authorization.slice('Bearer '.length);
+  const expected = Buffer.from(config.authToken);
+  const supplied = Buffer.from(suppliedToken);
+
+  return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+}
+
+function clientKey(req: express.Request): string {
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
 /**
  * 创建 Express 应用并配置 Streamable HTTP 传输层
  */
 export function createApp(): express.Express {
   const app = express();
+  app.disable('x-powered-by');
 
   // JSON body 解析
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '2mb' }));
 
-  // CORS 配置
+  // CORS 配置。注意: CORS 不是鉴权；真正保护依赖可选 MCP_AUTH_TOKEN。
   app.use(
     cors({
       origin: config.allowedOrigins.includes('*')
@@ -35,8 +63,55 @@ export function createApp(): express.Express {
     })
   );
 
-  // 会话管理
-  const transports: Record<string, StreamableHTTPServerTransport> = {};
+  const transports: Record<string, SessionRecord> = {};
+  const rateLimits: Record<string, RateLimitRecord> = {};
+
+  function cleanupSessions(): void {
+    const now = Date.now();
+    for (const [sessionId, record] of Object.entries(transports)) {
+      if (now - record.lastSeen > config.sessionTtlMs) {
+        logger.warn(`MCP 会话已超时，正在关闭: ${sessionId}`);
+        void record.transport.close().catch((error) => {
+          logger.error(`关闭超时会话 ${sessionId} 时出错:`, error);
+        });
+        delete transports[sessionId];
+      }
+    }
+  }
+
+  const cleanupTimer = setInterval(cleanupSessions, Math.min(config.sessionTtlMs, 60_000));
+  cleanupTimer.unref?.();
+
+  function rateLimit(req: express.Request, res: express.Response, next: express.NextFunction): void {
+    const key = clientKey(req);
+    const now = Date.now();
+    const record = rateLimits[key];
+
+    if (!record || now - record.windowStartedAt > config.rateLimitWindowMs) {
+      rateLimits[key] = { windowStartedAt: now, count: 1 };
+      next();
+      return;
+    }
+
+    record.count += 1;
+    if (record.count > config.rateLimitMax) {
+      res.status(429).json({ error: 'Too many MCP requests' });
+      return;
+    }
+
+    next();
+  }
+
+  function authenticate(req: express.Request, res: express.Response, next: express.NextFunction): void {
+    if (isAuthorized(req)) {
+      next();
+      return;
+    }
+
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  app.use('/mcp', rateLimit, authenticate);
 
   // ===== MCP POST 端点 =====
   app.post('/mcp', async (req, res) => {
@@ -46,19 +121,31 @@ export function createApp(): express.Express {
       let transport: StreamableHTTPServerTransport;
 
       if (sessionId && transports[sessionId]) {
-        // 复用已有的 transport
-        transport = transports[sessionId];
+        transports[sessionId].lastSeen = Date.now();
+        transport = transports[sessionId].transport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
-        // 新的初始化请求 - 创建新 transport
+        cleanupSessions();
+
+        if (Object.keys(transports).length >= config.maxSessions) {
+          res.status(503).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: 'Too many active MCP sessions',
+            },
+            id: null,
+          });
+          return;
+        }
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
             logger.info(`MCP 会话已初始化: ${sid}`);
-            transports[sid] = transport;
+            transports[sid] = { transport, lastSeen: Date.now() };
           },
         });
 
-        // 清理关闭的 transport
         transport.onclose = () => {
           const sid = transport.sessionId;
           if (sid && transports[sid]) {
@@ -67,14 +154,12 @@ export function createApp(): express.Express {
           }
         };
 
-        // 创建 MCP Server 并连接
         const server = createMcpServer();
         await server.connect(transport);
 
         await transport.handleRequest(req, res, req.body);
         return;
       } else {
-        // 无效请求
         res.status(400).json({
           jsonrpc: '2.0',
           error: {
@@ -86,7 +171,6 @@ export function createApp(): express.Express {
         return;
       }
 
-      // 使用已有的 transport 处理请求
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
       logger.error('处理 MCP 请求时出错:', error);
@@ -114,7 +198,8 @@ export function createApp(): express.Express {
 
     logger.info(`建立 SSE 连接: session=${sessionId}`);
 
-    const transport = transports[sessionId];
+    transports[sessionId].lastSeen = Date.now();
+    const transport = transports[sessionId].transport;
     await transport.handleRequest(req, res);
   });
 
@@ -130,7 +215,8 @@ export function createApp(): express.Express {
     logger.info(`终止会话: ${sessionId}`);
 
     try {
-      const transport = transports[sessionId];
+      transports[sessionId].lastSeen = Date.now();
+      const transport = transports[sessionId].transport;
       await transport.handleRequest(req, res);
     } catch (error) {
       logger.error('终止会话时出错:', error);
@@ -142,16 +228,32 @@ export function createApp(): express.Express {
 
   // ===== 健康检查端点 =====
   app.get('/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      name: 'code-repo-mcp-server',
-      version: '1.0.0',
-      activeSessions: Object.keys(transports).length,
-    });
+    if (config.exposePublicInfo) {
+      res.json({
+        status: 'ok',
+        name: 'code-repo-mcp-server',
+        version: '1.0.0',
+        activeSessions: Object.keys(transports).length,
+        authEnabled: Boolean(config.authToken),
+        terminalEnabled: config.enableTerminal,
+      });
+      return;
+    }
+
+    res.json({ status: 'ok' });
   });
 
   // ===== 根路径信息 =====
   app.get('/', (_req, res) => {
+    if (!config.exposePublicInfo) {
+      res.json({
+        name: 'Code Repository MCP Server',
+        status: 'ok',
+        mcpEndpoint: '/mcp',
+      });
+      return;
+    }
+
     res.json({
       name: 'Code Repository MCP Server',
       description: 'MCP Server for code repository operations via ChatGPT',
@@ -166,12 +268,11 @@ export function createApp(): express.Express {
         'search_files', 'search_content', 'get_file_tree',
         'git_status', 'git_diff', 'git_log', 'git_add', 'git_commit',
         'git_branch', 'git_show', 'git_push', 'git_pull',
-        'run_command',
+        ...(config.enableTerminal ? ['run_command'] : []),
       ],
     });
   });
 
-  // 返回 app 和 transports 用于清理
   (app as any).__transports = transports;
 
   return app;
