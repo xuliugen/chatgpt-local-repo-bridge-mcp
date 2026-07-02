@@ -115,10 +115,6 @@ export function loadConfig(): AppConfig {
   const enableTerminal = parseBoolean(process.env.ENABLE_TERMINAL, false);
   const allowAnyCommand = parseBoolean(process.env.ALLOW_ANY_COMMAND, false);
   const allowedCommands = parseList(process.env.ALLOWED_COMMANDS);
-  // 向后兼容旧配置名；语义已经从“前缀”改为“完整命令”。
-  if (allowedCommands.length === 0) {
-    allowedCommands.push(...parseList(process.env.ALLOWED_COMMAND_PREFIXES));
-  }
   const allowGitForcePush = parseBoolean(process.env.ALLOW_GIT_FORCE_PUSH, false);
   const exposePublicInfo = parseBoolean(process.env.EXPOSE_PUBLIC_INFO, false);
 
