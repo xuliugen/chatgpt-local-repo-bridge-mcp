@@ -34,6 +34,7 @@ ChatGPT 网页端 (chatgpt.com)
 |  ├── realpath / symlink 越权防护              |
 |  ├── 排除目录和敏感文件                       |
 |  ├── 文件读写大小限制                         |
+|  ├── Auth0 OAuth Bearer Token 校验             |
 |  ├── MCP session TTL / 最大会话数             |
 |  └── 简易请求限流                             |
 +----------------------------------------------+
@@ -69,8 +70,15 @@ WORKSPACES=D:\CodeX\chatgpt-local-repo-bridge-mcp,D:\CodeX\mindx-agent
 
 EXCLUDED_DIRS=node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,DS_Store,.qoder
 EXCLUDED_FILES=.env,.env.local,.env.development,.env.development.local,.env.production,.env.production.local,.env.test,.env.test.local,.env.staging,.env.staging.local,.envrc,.npmrc,.pypirc,*.pem,*.key,*.crt,*.cer,*.p12,*.pfx,id_rsa,id_rsa.*,id_ed25519,id_ed25519.*
-
 ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
+
+OAUTH_ENABLED=true
+PUBLIC_MCP_URL=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+OAUTH_ISSUER=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/
+OAUTH_AUDIENCE=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+OAUTH_JWKS_URI=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/.well-known/jwks.json
+OAUTH_SCOPES=repo:read,repo:write,repo:git
+
 EXPOSE_PUBLIC_INFO=false
 
 ENABLE_TERMINAL=false
@@ -143,6 +151,69 @@ https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 > 关键点：必须以 `/mcp` 结尾，不要只填写 ngrok 根路径。
 
+## Auth0 OAuth 配置
+
+公网暴露本地仓库 MCP 时建议启用 OAuth。当前实现把本服务作为 OAuth Resource Server，Auth0 负责用户登录和 access token 签发，本服务负责验证 JWT 签名、issuer、audience、过期时间和 scope。
+
+### 1. Auth0 创建 API
+
+在 Auth0 Dashboard 中进入 `Applications -> APIs -> Create API`：
+
+```text
+Name: chatgpt-local-repo-bridge-mcp
+Identifier: https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+Signing Algorithm: RS256
+```
+
+`Identifier` 必须和 `.env` 中的 `OAUTH_AUDIENCE` 一致。
+
+### 2. Auth0 添加 Permissions
+
+在该 API 的 Permissions 中添加：
+
+```text
+repo:read
+repo:write
+repo:git
+```
+
+当前服务按工具类型要求 scope：
+
+```text
+repo:read   读取文件、目录、搜索、Git 只读操作
+repo:write  文件写入、编辑、删除、移动、创建目录
+repo:git    git add / commit / push / pull
+```
+
+### 3. MCP 服务配置
+
+`.env` 中配置：
+
+```env
+OAUTH_ENABLED=true
+PUBLIC_MCP_URL=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+OAUTH_ISSUER=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/
+OAUTH_AUDIENCE=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+OAUTH_JWKS_URI=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/.well-known/jwks.json
+OAUTH_SCOPES=repo:read,repo:write,repo:git
+```
+
+注意：`PUBLIC_MCP_URL`、Auth0 API Identifier、`OAUTH_AUDIENCE` 建议保持完全一致。Auth0 issuer 末尾 `/` 要和 Auth0 discovery 文档中的 `issuer` 保持一致。
+
+### 4. 验证 OAuth 元数据
+
+启动服务后访问：
+
+```bash
+curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/.well-known/oauth-protected-resource
+```
+
+未带 token 访问 MCP 应返回 `401`，并包含 `WWW-Authenticate`：
+
+```bash
+curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
+```
+
 ## 在 ChatGPT 中配置 MCP 应用
 
 1. 打开 ChatGPT 网页端。
@@ -150,6 +221,7 @@ https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 3. 开启 Developer mode。
 4. 创建自定义 MCP App / Connector。
 5. MCP Server URL 填写 `https://<你的ngrok地址>/mcp`。
+6. 身份验证选择 OAuth。
 
 ## 工具列表
 
@@ -257,9 +329,33 @@ MAX_WRITE_BYTES=2097152
 
 `read_file` / `edit_file` 会拒绝读取超出 `MAX_READ_BYTES` 的文件。`write_file` / `edit_file` 会拒绝写入超出 `MAX_WRITE_BYTES` 的内容。
 
+### OAuth / Auth0 认证
+
+启用 `OAUTH_ENABLED=true` 后，服务会暴露 OAuth protected resource metadata：
+
+```text
+GET /.well-known/oauth-protected-resource
+GET /.well-known/oauth-protected-resource/mcp
+```
+
+所有 `/mcp` 请求都必须携带：
+
+```http
+Authorization: Bearer <access_token>
+```
+
+服务端会使用 `OAUTH_JWKS_URI` 校验 JWT 签名，并校验：
+
+```text
+iss === OAUTH_ISSUER
+aud === OAUTH_AUDIENCE
+exp / nbf 有效
+scope 或 permissions 覆盖当前工具需要的权限
+```
+
 ### CORS 说明
 
-CORS 不是鉴权，不能阻止 curl、脚本或其他服务端请求直接访问公网 MCP 地址。公网暴露时建议只短时间开启 ngrok。
+CORS 不是鉴权，不能阻止 curl、脚本或其他服务端请求直接访问公网 MCP 地址。公网暴露时建议启用 OAuth，并只短时间开启 ngrok。
 
 ### Session TTL 与限流
 
@@ -313,6 +409,8 @@ src/
 | `/mcp` | POST | MCP 初始化和工具调用 |
 | `/mcp` | GET | SSE 流 / 服务端通知 |
 | `/mcp` | DELETE | 终止 MCP session |
+| `/.well-known/oauth-protected-resource` | GET | OAuth protected resource metadata |
+| `/.well-known/oauth-protected-resource/mcp` | GET | OAuth protected resource metadata 兼容路径 |
 | `/health` | GET | 健康检查 |
 | `/` | GET | 服务信息 |
 
@@ -321,7 +419,7 @@ src/
 | 问题 | 常见原因 | 处理方式 |
 |------|----------|----------|
 | 创建连接器时报 `Something went wrong` | URL 不是 `/mcp`、ngrok 未运行、tool schema/annotations 不合法 | 确认 URL 为 `https://<ngrok>/mcp`，重启服务，查看本地日志和 ngrok 请求日志 |
-| `/health` 能访问，但 ChatGPT 连接失败 | MCP 初始化失败 | 查看本地日志确认 MCP 初始化是否成功，重启服务 |
+| `/health` 能访问，但 ChatGPT 连接失败 | MCP 初始化失败，或 OAuth metadata / Auth0 配置不正确 | 查看本地日志确认 MCP 初始化是否成功，检查 `/.well-known/oauth-protected-resource` 和 Auth0 issuer discovery |
 | 服务启动失败 | `WORKSPACES` 配置了不存在或非目录路径 | 修正 `WORKSPACES` 后重启 |
 | 工具数量从 21 变成 20 | `ENABLE_TERMINAL=false` | 这是默认安全行为；需要终端工具时显式开启 |
 | `run_command` 不存在 | 终端工具默认未注册 | 设置 `ENABLE_TERMINAL=true` 并重启服务 |
@@ -332,6 +430,7 @@ src/
 | `git_push --force` 被拒绝 | 默认禁止 force push | 需要时设置 `ALLOW_GIT_FORCE_PUSH=true`，谨慎使用 |
 | `git_push` / `git_pull` 分支名被拒绝 | 分支参数包含 refspec 或异常 ref 字符 | 传入普通分支名，例如 `main` 或 `feature/foo` |
 | 搜索速度慢 | 未安装 ripgrep，使用 Node fallback | 安装 ripgrep |
+| OAuth 登录后仍 401 | Auth0 API Identifier 与 `OAUTH_AUDIENCE` 不一致、issuer 末尾 `/` 不一致、token 缺少 scope | 检查 Auth0 API Identifier、`.env` 配置和 token claims |
 
 ## ripgrep 可选优化
 
@@ -358,6 +457,7 @@ winget install BurntSushi.ripgrep.MSVC
 ## 安全建议
 
 - 不要长期公开 ngrok 地址。
+- 公网暴露时建议启用 `OAUTH_ENABLED=true`。
 - 不要把 `WORKSPACES` 指到用户主目录、磁盘根目录或包含密钥的目录。
 - 不要在公网环境启用 `ALLOW_ANY_COMMAND=true`。
 - 不要在公网环境启用 `EXPOSE_PUBLIC_INFO=true`。

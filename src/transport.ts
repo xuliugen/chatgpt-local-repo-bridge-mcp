@@ -6,6 +6,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createMcpServer } from './server.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+import { protectedResourceMetadata, requireOAuth } from './auth/oauth.js';
 
 interface SessionRecord {
   transport: StreamableHTTPServerTransport;
@@ -97,7 +98,26 @@ export function createApp(): express.Express {
     next();
   }
 
+  app.get('/.well-known/oauth-protected-resource', (_req, res) => {
+    if (!config.oauthEnabled) {
+      res.status(404).json({ error: 'OAuth is not enabled' });
+      return;
+    }
+
+    res.json(protectedResourceMetadata());
+  });
+
+  app.get('/.well-known/oauth-protected-resource/mcp', (_req, res) => {
+    if (!config.oauthEnabled) {
+      res.status(404).json({ error: 'OAuth is not enabled' });
+      return;
+    }
+
+    res.json(protectedResourceMetadata());
+  });
+
   app.use('/mcp', rateLimit);
+  app.use('/mcp', requireOAuth);
 
   // ===== MCP POST 端点 =====
   app.post('/mcp', async (req, res) => {
@@ -245,6 +265,7 @@ export function createApp(): express.Express {
       version: '1.0.0',
       endpoints: {
         mcp: 'POST/GET/DELETE /mcp - MCP Streamable HTTP endpoint',
+        oauthProtectedResource: 'GET /.well-known/oauth-protected-resource - OAuth protected resource metadata',
         health: 'GET /health - Health check',
       },
       tools: [

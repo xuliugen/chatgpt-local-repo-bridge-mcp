@@ -8,6 +8,18 @@ dotenv.config();
 export interface AppConfig {
   /** MCP 服务端口 */
   port: number;
+  /** 是否启用 OAuth Bearer Token 校验 */
+  oauthEnabled: boolean;
+  /** 公网 MCP endpoint URL，例如 https://example.com/mcp */
+  publicMcpUrl: string;
+  /** OAuth / OIDC issuer，例如 Auth0 tenant URL */
+  oauthIssuer: string;
+  /** OAuth access token audience */
+  oauthAudience: string;
+  /** OAuth issuer JWKS URI */
+  oauthJwksUri: string;
+  /** MCP 工具所需 OAuth scopes */
+  oauthScopes: string[];
   /** 允许访问的工作区目录列表 (已解析为绝对路径) */
   workspaces: string[];
   /** 排除的目录名列表 (匹配任意层级，如 node_modules, dist, .git 等) */
@@ -79,6 +91,25 @@ function validateWorkspace(workspace: string): string {
 export function loadConfig(): AppConfig {
   const port = parseNumber(process.env.PORT, 3100, 1, 65535);
 
+  const oauthEnabled = parseBoolean(process.env.OAUTH_ENABLED, false);
+  const publicMcpUrl = process.env.PUBLIC_MCP_URL?.trim() || `http://localhost:${port}/mcp`;
+  const oauthIssuer = process.env.OAUTH_ISSUER?.trim() || '';
+  const oauthAudience = process.env.OAUTH_AUDIENCE?.trim() || publicMcpUrl;
+  const oauthJwksUri = process.env.OAUTH_JWKS_URI?.trim() || '';
+  const oauthScopes = parseList(process.env.OAUTH_SCOPES);
+  if (oauthScopes.length === 0) {
+    oauthScopes.push('repo:read', 'repo:write', 'repo:git');
+  }
+
+  if (oauthEnabled) {
+    if (!publicMcpUrl.startsWith('https://') && !publicMcpUrl.startsWith('http://localhost:')) {
+      throw new Error('启用 OAuth 时 PUBLIC_MCP_URL 必须是 HTTPS URL，或本地调试使用 http://localhost。');
+    }
+    if (!oauthIssuer || !oauthAudience || !oauthJwksUri) {
+      throw new Error('启用 OAuth 时必须配置 OAUTH_ISSUER、OAUTH_AUDIENCE 和 OAUTH_JWKS_URI。');
+    }
+  }
+
   const configuredWorkspaces = parseList(process.env.WORKSPACES);
   const workspaces = (configuredWorkspaces.length > 0 ? configuredWorkspaces : [process.cwd()])
     .map(validateWorkspace);
@@ -124,6 +155,12 @@ export function loadConfig(): AppConfig {
 
   return {
     port,
+    oauthEnabled,
+    publicMcpUrl,
+    oauthIssuer,
+    oauthAudience,
+    oauthJwksUri,
+    oauthScopes,
     workspaces,
     excludedDirs,
     excludedFilePatterns,

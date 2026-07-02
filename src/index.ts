@@ -23,6 +23,12 @@ async function main(): Promise<void> {
   logger.info(`排除目录: ${config.excludedDirs.join(', ')}`);
   logger.info(`排除文件: ${config.excludedFilePatterns.join(', ')}`);
   logger.info(`CORS 来源: ${config.allowedOrigins.join(', ')}`);
+  logger.info(`OAuth 认证: ${config.oauthEnabled ? '已启用' : '已禁用'}`);
+  if (config.oauthEnabled) {
+    logger.info(`公网 MCP URL: ${config.publicMcpUrl}`);
+    logger.info(`OAuth Issuer: ${config.oauthIssuer}`);
+    logger.info(`OAuth Audience: ${config.oauthAudience}`);
+  }
   logger.info(`终端工具: ${config.enableTerminal ? '已启用' : '已禁用'}`);
   logger.info('');
 
@@ -35,6 +41,7 @@ async function main(): Promise<void> {
     logger.info('');
     logger.info(`  MCP 端点:    http://localhost:${config.port}/mcp`);
     logger.info(`  健康检查:    http://localhost:${config.port}/health`);
+    logger.info(`  OAuth 元数据: http://localhost:${config.port}/.well-known/oauth-protected-resource`);
     logger.info(`  服务信息:    http://localhost:${config.port}/`);
     logger.info('');
     logger.info('在 ChatGPT 网页端中:');
