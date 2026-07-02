@@ -22,6 +22,39 @@ function clientKey(req: express.Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
 }
 
+function mcpSessionId(req: express.Request): string | undefined {
+  const value = req.headers['mcp-session-id'];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function shortSessionId(sessionId: string | undefined): string {
+  if (!sessionId) return 'none';
+  return sessionId.length <= 12 ? sessionId : `${sessionId.slice(0, 8)}...${sessionId.slice(-4)}`;
+}
+
+function toolNamesFromBody(body: unknown): string[] {
+  const items = Array.isArray(body) ? body : [body];
+  return items
+    .map((item) => {
+      if (!item || typeof item !== 'object') return undefined;
+      const jsonRpc = item as {
+        method?: unknown;
+        params?: {
+          name?: unknown;
+        };
+      };
+      if (jsonRpc.method === 'tools/call' && typeof jsonRpc.params?.name === 'string') {
+        return jsonRpc.params.name;
+      }
+      if (typeof jsonRpc.method === 'string') {
+        return jsonRpc.method;
+      }
+      return undefined;
+    })
+    .filter((name): name is string => Boolean(name));
+}
+
 /**
  * 创建 Express 应用并配置 Streamable HTTP 传输层
  */
@@ -116,12 +149,38 @@ export function createApp(): express.Express {
     res.json(protectedResourceMetadata());
   });
 
+  app.use('/mcp', (req, res, next) => {
+    const startedAt = Date.now();
+    const sessionId = mcpSessionId(req);
+    const requestId = randomUUID().slice(0, 8);
+    const tools = req.method === 'POST' ? toolNamesFromBody(req.body) : [];
+    const toolSummary = tools.length > 0 ? ` tools=${tools.join(',')}` : '';
+
+    logger.info(
+      `MCP 请求开始: id=${requestId} method=${req.method} path=${req.originalUrl} session=${shortSessionId(sessionId)} ip=${clientKey(req)}${toolSummary}`
+    );
+
+    let logged = false;
+    const logEnd = (event: 'finish' | 'close') => {
+      if (logged) return;
+      logged = true;
+      logger.info(
+        `MCP 请求结束: id=${requestId} event=${event} status=${res.statusCode} durationMs=${Date.now() - startedAt} session=${shortSessionId(sessionId)}`
+      );
+    };
+
+    res.once('finish', () => logEnd('finish'));
+    res.once('close', () => logEnd('close'));
+
+    next();
+  });
+
   app.use('/mcp', rateLimit);
   app.use('/mcp', requireOAuth);
 
   // ===== MCP POST 端点 =====
   app.post('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const sessionId = mcpSessionId(req);
 
     try {
       let transport: StreamableHTTPServerTransport;
@@ -195,7 +254,7 @@ export function createApp(): express.Express {
 
   // ===== MCP GET 端点 (SSE 流) =====
   app.get('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const sessionId = mcpSessionId(req);
 
     if (!sessionId || !transports[sessionId]) {
       res.status(400).json({ error: 'Invalid or missing session ID' });
@@ -204,14 +263,21 @@ export function createApp(): express.Express {
 
     logger.info(`建立 SSE 连接: session=${sessionId}`);
 
-    transports[sessionId].lastSeen = Date.now();
-    const transport = transports[sessionId].transport;
-    await transport.handleRequest(req as any, res);
+    try {
+      transports[sessionId].lastSeen = Date.now();
+      const transport = transports[sessionId].transport;
+      await transport.handleRequest(req as any, res);
+    } catch (error) {
+      logger.error('处理 MCP SSE 请求时出错:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error processing SSE connection' });
+      }
+    }
   });
 
   // ===== MCP DELETE 端点 (终止会话) =====
   app.delete('/mcp', async (req, res) => {
-    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const sessionId = mcpSessionId(req);
 
     if (!sessionId || !transports[sessionId]) {
       res.status(400).json({ error: 'Invalid or missing session ID' });

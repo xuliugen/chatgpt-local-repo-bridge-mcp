@@ -9,6 +9,20 @@ interface ManagedTransportRecord {
   lastSeen: number;
 }
 
+function installGlobalErrorHandlers(): void {
+  process.on('uncaughtException', (error) => {
+    logger.error('未捕获异常，进程即将退出:', error);
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    logger.error('未处理 Promise rejection，进程即将退出:', reason);
+    process.exit(1);
+  });
+}
+
+installGlobalErrorHandlers();
+
 /**
  * MCP Code Repository Server 入口
  */
