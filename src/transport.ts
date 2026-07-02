@@ -10,7 +10,9 @@ import { protectedResourceMetadata, requireOAuth } from './auth/oauth.js';
 
 interface SessionRecord {
   transport: StreamableHTTPServerTransport;
+  createdAt: number;
   lastSeen: number;
+  requestCount: number;
 }
 
 interface RateLimitRecord {
@@ -97,9 +99,11 @@ export function createApp(): express.Express {
 
     delete transports[sessionId];
 
-    const idleMs = Date.now() - record.lastSeen;
+    const now = Date.now();
+    const idleMs = now - record.lastSeen;
+    const ageMs = now - record.createdAt;
     logger.warn(
-      `MCP 会话已回收: session=${shortSessionId(sessionId)} reason=${reason} idleMs=${idleMs} activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
+      `MCP 会话已回收: session=${shortSessionId(sessionId)} reason=${reason} idleMs=${idleMs} ageMs=${ageMs} requestCount=${record.requestCount} activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
     );
 
     void record.transport.close().catch((error) => {
@@ -227,9 +231,15 @@ export function createApp(): express.Express {
       let transport: StreamableHTTPServerTransport;
 
       if (sessionId && transports[sessionId]) {
-        transports[sessionId].lastSeen = Date.now();
-        transport = transports[sessionId].transport;
+        const record = transports[sessionId];
+        record.lastSeen = Date.now();
+        record.requestCount += 1;
+        logger.info(
+          `复用 MCP 会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+        );
+        transport = record.transport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        logger.info(`准备创建新 MCP 会话: reason=initialize_without_session activeSessions=${activeSessionCount()}`);
         reclaimIdleSessionsForCapacity();
 
         if (activeSessionCount() >= config.maxSessions) {
@@ -250,16 +260,29 @@ export function createApp(): express.Express {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
-            logger.info(`MCP 会话已初始化: ${sid}`);
-            transports[sid] = { transport, lastSeen: Date.now() };
+            const now = Date.now();
+            transports[sid] = {
+              transport,
+              createdAt: now,
+              lastSeen: now,
+              requestCount: 1,
+            };
+            logger.info(
+              `MCP 会话已初始化: session=${shortSessionId(sid)} activeSessions=${activeSessionCount()} requestCount=1`
+            );
           },
         });
 
         transport.onclose = () => {
           const sid = transport.sessionId;
-          if (sid && transports[sid]) {
-            logger.info(`MCP 会话已关闭: ${sid}`);
+          const record = sid ? transports[sid] : undefined;
+          if (sid && record) {
+            logger.info(
+              `MCP transport 已关闭: session=${shortSessionId(sid)} ageMs=${Date.now() - record.createdAt} requestCount=${record.requestCount}`
+            );
             delete transports[sid];
+          } else {
+            logger.info(`MCP transport 已关闭: session=${shortSessionId(sid)}`);
           }
         };
 
@@ -269,6 +292,9 @@ export function createApp(): express.Express {
         await transport.handleRequest(req as any, res, req.body);
         return;
       } else {
+        logger.warn(
+          `MCP 会话未命中: session=${shortSessionId(sessionId)} hasSessionHeader=${Boolean(sessionId)} isInitialize=${isInitializeRequest(req.body)} activeSessions=${activeSessionCount()}`
+        );
         res.status(400).json({
           jsonrpc: '2.0',
           error: {
@@ -305,11 +331,15 @@ export function createApp(): express.Express {
       return;
     }
 
-    logger.info(`建立 SSE 连接: session=${sessionId}`);
+    const record = transports[sessionId];
+    record.requestCount += 1;
+    logger.info(
+      `建立 SSE 连接: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+    );
 
     try {
-      transports[sessionId].lastSeen = Date.now();
-      const transport = transports[sessionId].transport;
+      record.lastSeen = Date.now();
+      const transport = record.transport;
       await transport.handleRequest(req as any, res);
     } catch (error) {
       logger.error('处理 MCP SSE 请求时出错:', error);
@@ -328,11 +358,15 @@ export function createApp(): express.Express {
       return;
     }
 
-    logger.info(`终止会话: ${sessionId}`);
+    const record = transports[sessionId];
+    record.requestCount += 1;
+    logger.info(
+      `终止会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+    );
 
     try {
-      transports[sessionId].lastSeen = Date.now();
-      const transport = transports[sessionId].transport;
+      record.lastSeen = Date.now();
+      const transport = record.transport;
       await transport.handleRequest(req as any, res);
     } catch (error) {
       logger.error('终止会话时出错:', error);
