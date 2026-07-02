@@ -76,7 +76,6 @@ OAUTH_ENABLED=true
 PUBLIC_MCP_URL=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 OAUTH_ISSUER=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/
 OAUTH_AUDIENCE=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
-OAUTH_JWKS_URI=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/.well-known/jwks.json
 OAUTH_SCOPES=repo:read,repo:write,repo:git
 
 EXPOSE_PUBLIC_INFO=false
@@ -194,7 +193,6 @@ OAUTH_ENABLED=true
 PUBLIC_MCP_URL=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 OAUTH_ISSUER=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/
 OAUTH_AUDIENCE=https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
-OAUTH_JWKS_URI=https://dev-j62oyjzrqhlzk5b5.us.auth0.com/.well-known/jwks.json
 OAUTH_SCOPES=repo:read,repo:write,repo:git
 ```
 
@@ -344,7 +342,7 @@ GET /.well-known/oauth-protected-resource/mcp
 Authorization: Bearer <access_token>
 ```
 
-服务端会使用 `OAUTH_JWKS_URI` 校验 JWT 签名，并校验：
+服务端使用 `express-oauth2-jwt-bearer` 根据 `OAUTH_ISSUER` 和 `OAUTH_AUDIENCE` 校验 JWT，并校验：
 
 ```text
 iss === OAUTH_ISSUER

@@ -20,6 +20,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-oauth2-jwt-bearer": "^1.7.1",
     "glob": "^13.0.6",
     "simple-git": "^3.36.0",
     "zod": "^4.4.3"

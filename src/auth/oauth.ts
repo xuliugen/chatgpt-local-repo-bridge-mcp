@@ -1,35 +1,10 @@
-import type { Request, Response, NextFunction } from 'express';
-import { createPublicKey, createVerify } from 'node:crypto';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
+import { auth } from 'express-oauth2-jwt-bearer';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
 type JwtPrimitive = string | number | boolean | null;
 type JwtPayload = Record<string, JwtPrimitive | JwtPrimitive[]>;
-
-interface JwtHeader {
-  alg?: string;
-  kid?: string;
-  typ?: string;
-}
-
-interface JwksKey {
-  kty?: string;
-  kid?: string;
-  alg?: string;
-  use?: string;
-  n?: string;
-  e?: string;
-  [key: string]: unknown;
-}
-
-interface JwksResponse {
-  keys?: JwksKey[];
-}
-
-interface CachedJwks {
-  expiresAt: number;
-  keys: JwksKey[];
-}
 
 interface ToolCallRequest {
   name: string;
@@ -61,9 +36,7 @@ const HIGH_RISK_TOOLS = new Set([
   'run_command',
 ]);
 
-const JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
-const CLOCK_SKEW_SECONDS = 60;
-let cachedJwks: CachedJwks | undefined;
+let jwtAuthMiddleware: RequestHandler | undefined;
 
 function publicOrigin(): string {
   return new URL(config.publicMcpUrl).origin;
@@ -83,133 +56,16 @@ export function protectedResourceMetadata() {
   };
 }
 
-function base64UrlDecode(input: string): Buffer {
-  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
-  return Buffer.from(padded, 'base64');
-}
-
-function parseJwtPart<T>(part: string, label: string): T {
-  try {
-    return JSON.parse(base64UrlDecode(part).toString('utf-8')) as T;
-  } catch {
-    throw new Error(`Invalid JWT ${label}`);
-  }
-}
-
-function splitJwt(token: string): { header: JwtHeader; payload: JwtPayload; signingInput: string; signature: Buffer } {
-  const parts = token.split('.');
-  if (parts.length !== 3 || parts.some((part) => !part)) {
-    throw new Error('Invalid JWT format');
+function getJwtAuthMiddleware(): RequestHandler {
+  if (!jwtAuthMiddleware) {
+    jwtAuthMiddleware = auth({
+      issuerBaseURL: config.oauthIssuer,
+      audience: config.oauthAudience,
+      tokenSigningAlg: 'RS256',
+    });
   }
 
-  return {
-    header: parseJwtPart<JwtHeader>(parts[0], 'header'),
-    payload: parseJwtPart<JwtPayload>(parts[1], 'payload'),
-    signingInput: `${parts[0]}.${parts[1]}`,
-    signature: base64UrlDecode(parts[2]),
-  };
-}
-
-async function fetchJwks(): Promise<JwksKey[]> {
-  const now = Date.now();
-  if (cachedJwks && cachedJwks.expiresAt > now) {
-    return cachedJwks.keys;
-  }
-
-  const response = await fetch(config.oauthJwksUri, {
-    headers: { Accept: 'application/json' },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch JWKS: HTTP ${response.status}`);
-  }
-
-  const body = await response.json() as JwksResponse;
-  if (!Array.isArray(body.keys)) {
-    throw new Error('Invalid JWKS response');
-  }
-
-  cachedJwks = {
-    expiresAt: now + JWKS_CACHE_TTL_MS,
-    keys: body.keys,
-  };
-
-  return body.keys;
-}
-
-async function findSigningKey(header: JwtHeader): Promise<JwksKey> {
-  if (header.alg !== 'RS256') {
-    throw new Error(`Unsupported JWT alg: ${header.alg ?? '(missing)'}`);
-  }
-
-  const keys = await fetchJwks();
-  const key = keys.find((candidate) => {
-    if (header.kid && candidate.kid !== header.kid) return false;
-    if (candidate.use && candidate.use !== 'sig') return false;
-    if (candidate.alg && candidate.alg !== 'RS256') return false;
-    return candidate.kty === 'RSA';
-  });
-
-  if (!key) {
-    throw new Error(`No matching JWKS key found for kid=${header.kid ?? '(missing)'}`);
-  }
-
-  return key;
-}
-
-function verifySignature(signingInput: string, signature: Buffer, key: JwksKey): void {
-  const publicKey = createPublicKey({ key, format: 'jwk' });
-  const verifier = createVerify('RSA-SHA256');
-  verifier.update(signingInput);
-  verifier.end();
-
-  if (!verifier.verify(publicKey, signature)) {
-    throw new Error('Invalid JWT signature');
-  }
-}
-
-function stringClaim(payload: JwtPayload, name: string): string | undefined {
-  const value = payload[name];
-  return typeof value === 'string' ? value : undefined;
-}
-
-function numberClaim(payload: JwtPayload, name: string): number | undefined {
-  const value = payload[name];
-  return typeof value === 'number' ? value : undefined;
-}
-
-function audienceMatches(payload: JwtPayload): boolean {
-  const aud = payload.aud;
-  if (typeof aud === 'string') {
-    return aud === config.oauthAudience;
-  }
-  if (Array.isArray(aud)) {
-    return aud.includes(config.oauthAudience);
-  }
-  return false;
-}
-
-function verifyStandardClaims(payload: JwtPayload): void {
-  const issuer = stringClaim(payload, 'iss');
-  if (issuer !== config.oauthIssuer) {
-    throw new Error('Invalid JWT issuer');
-  }
-
-  if (!audienceMatches(payload)) {
-    throw new Error('Invalid JWT audience');
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  const expiresAt = numberClaim(payload, 'exp');
-  if (expiresAt === undefined || expiresAt <= now - CLOCK_SKEW_SECONDS) {
-    throw new Error('JWT is expired');
-  }
-
-  const notBefore = numberClaim(payload, 'nbf');
-  if (notBefore !== undefined && notBefore > now + CLOCK_SKEW_SECONDS) {
-    throw new Error('JWT is not active yet');
-  }
+  return jwtAuthMiddleware;
 }
 
 function requestBodyItems(body: unknown): unknown[] {
@@ -308,18 +164,23 @@ function sendUnauthorized(res: Response, requiredScopes: string[]): void {
   res.status(401).json({ error: 'Unauthorized' });
 }
 
-async function verifyAccessToken(token: string, requiredScopes: string[]): Promise<JwtPayload> {
-  const { header, payload, signingInput, signature } = splitJwt(token);
-  const key = await findSigningKey(header);
+function runJwtAuth(req: Request, res: Response): Promise<JwtPayload> {
+  return new Promise((resolve, reject) => {
+    getJwtAuthMiddleware()(req, res, (error?: unknown) => {
+      if (error) {
+        reject(error);
+        return;
+      }
 
-  verifySignature(signingInput, signature, key);
-  verifyStandardClaims(payload);
+      const payload = req.auth?.payload as JwtPayload | undefined;
+      if (!payload) {
+        reject(new Error('Missing authenticated JWT payload'));
+        return;
+      }
 
-  if (!hasRequiredScopes(payload, requiredScopes)) {
-    throw new Error(`Missing required OAuth scopes: ${requiredScopes.join(', ')}`);
-  }
-
-  return payload;
+      resolve(payload);
+    });
+  });
 }
 
 export async function requireOAuth(
@@ -333,25 +194,20 @@ export async function requireOAuth(
   }
 
   const requiredScopes = requiredScopesForRequest(req);
-  const authorization = req.header('authorization');
-
-  if (!authorization?.startsWith('Bearer ')) {
-    sendUnauthorized(res, requiredScopes);
-    return;
-  }
-
-  const token = authorization.slice('Bearer '.length).trim();
-  if (!token) {
-    sendUnauthorized(res, requiredScopes);
-    return;
-  }
 
   try {
-    const payload = await verifyAccessToken(token, requiredScopes);
+    const payload = await runJwtAuth(req, res);
+
+    if (!hasRequiredScopes(payload, requiredScopes)) {
+      throw new Error(`Missing required OAuth scopes: ${requiredScopes.join(', ')}`);
+    }
+
     res.locals.oauth = payload;
     next();
   } catch (error) {
     logger.warn(`OAuth token 校验失败: ${(error as Error).message}`);
-    sendUnauthorized(res, requiredScopes);
+    if (!res.headersSent) {
+      sendUnauthorized(res, requiredScopes);
+    }
   }
 }

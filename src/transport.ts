@@ -163,7 +163,7 @@ export function createApp(): express.Express {
         const server = createMcpServer();
         await server.connect(transport);
 
-        await transport.handleRequest(req, res, req.body);
+        await transport.handleRequest(req as any, res, req.body);
         return;
       } else {
         res.status(400).json({
@@ -177,7 +177,7 @@ export function createApp(): express.Express {
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      await transport.handleRequest(req as any, res, req.body);
     } catch (error) {
       logger.error('处理 MCP 请求时出错:', error);
       if (!res.headersSent) {
@@ -206,7 +206,7 @@ export function createApp(): express.Express {
 
     transports[sessionId].lastSeen = Date.now();
     const transport = transports[sessionId].transport;
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req as any, res);
   });
 
   // ===== MCP DELETE 端点 (终止会话) =====
@@ -223,7 +223,7 @@ export function createApp(): express.Express {
     try {
       transports[sessionId].lastSeen = Date.now();
       const transport = transports[sessionId].transport;
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req as any, res);
     } catch (error) {
       logger.error('终止会话时出错:', error);
       if (!res.headersSent) {

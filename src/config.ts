@@ -16,8 +16,6 @@ export interface AppConfig {
   oauthIssuer: string;
   /** OAuth access token audience */
   oauthAudience: string;
-  /** OAuth issuer JWKS URI */
-  oauthJwksUri: string;
   /** MCP 工具所需 OAuth scopes */
   oauthScopes: string[];
   /** 允许访问的工作区目录列表 (已解析为绝对路径) */
@@ -95,7 +93,6 @@ export function loadConfig(): AppConfig {
   const publicMcpUrl = process.env.PUBLIC_MCP_URL?.trim() || `http://localhost:${port}/mcp`;
   const oauthIssuer = process.env.OAUTH_ISSUER?.trim() || '';
   const oauthAudience = process.env.OAUTH_AUDIENCE?.trim() || publicMcpUrl;
-  const oauthJwksUri = process.env.OAUTH_JWKS_URI?.trim() || '';
   const oauthScopes = parseList(process.env.OAUTH_SCOPES);
   if (oauthScopes.length === 0) {
     oauthScopes.push('repo:read', 'repo:write', 'repo:git');
@@ -105,8 +102,8 @@ export function loadConfig(): AppConfig {
     if (!publicMcpUrl.startsWith('https://') && !publicMcpUrl.startsWith('http://localhost:')) {
       throw new Error('启用 OAuth 时 PUBLIC_MCP_URL 必须是 HTTPS URL，或本地调试使用 http://localhost。');
     }
-    if (!oauthIssuer || !oauthAudience || !oauthJwksUri) {
-      throw new Error('启用 OAuth 时必须配置 OAUTH_ISSUER、OAUTH_AUDIENCE 和 OAUTH_JWKS_URI。');
+    if (!oauthIssuer || !oauthAudience) {
+      throw new Error('启用 OAuth 时必须配置 OAUTH_ISSUER 和 OAUTH_AUDIENCE。');
     }
   }
 
@@ -159,7 +156,6 @@ export function loadConfig(): AppConfig {
     publicMcpUrl,
     oauthIssuer,
     oauthAudience,
-    oauthJwksUri,
     oauthScopes,
     workspaces,
     excludedDirs,
