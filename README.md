@@ -64,6 +64,8 @@ Copy-Item .env.example .env
 
 推荐的基础配置：
 
+> 公网暴露 `/mcp` 时必须保持 `OAUTH_ENABLED=true`。如果设置为 `false`，服务仍会注册 OAuth 中间件，但中间件会直接放行 `/mcp` 请求，不校验 `Authorization`、JWT、issuer、audience 或 scope。
+
 ```env
 PORT=3100
 WORKSPACES=D:\CodeX\chatgpt-local-repo-bridge-mcp,D:\CodeX\mindx-agent
@@ -181,7 +183,7 @@ repo:git
 ```text
 repo:read   读取文件、目录、搜索、Git 只读操作
 repo:write  文件写入、编辑、删除、移动、创建目录
-repo:git    git add / commit / push / pull
+repo:git    git add / commit / push / pull；当前 run_command 也要求该 scope
 ```
 
 ### 3. MCP 服务配置
@@ -197,6 +199,8 @@ OAUTH_SCOPES=repo:read,repo:write,repo:git
 ```
 
 注意：`PUBLIC_MCP_URL`、Auth0 API Identifier、`OAUTH_AUDIENCE` 建议保持完全一致。Auth0 issuer 末尾 `/` 要和 Auth0 discovery 文档中的 `issuer` 保持一致。
+
+不再需要配置 `OAUTH_JWKS_URI`。服务端使用 `express-oauth2-jwt-bearer` 根据 `OAUTH_ISSUER` 进行 OIDC/JWKS 发现，并结合 `OAUTH_AUDIENCE` 校验 access token。
 
 ### 4. 验证 OAuth 元数据
 
@@ -329,7 +333,7 @@ MAX_WRITE_BYTES=2097152
 
 ### OAuth / Auth0 认证
 
-启用 `OAUTH_ENABLED=true` 后，服务会暴露 OAuth protected resource metadata：
+启用 `OAUTH_ENABLED=true` 后，`/mcp` 会强制校验 OAuth Bearer token，并暴露 OAuth protected resource metadata：
 
 ```text
 GET /.well-known/oauth-protected-resource
@@ -342,13 +346,15 @@ GET /.well-known/oauth-protected-resource/mcp
 Authorization: Bearer <access_token>
 ```
 
+如果 `OAUTH_ENABLED=false`，`/mcp` 不会进行 OAuth 认证，任何能访问该地址的客户端都可以调用已注册工具。该模式只适合本机开发或受信任内网，不应用于公网 ngrok 地址。
+
 服务端使用 `express-oauth2-jwt-bearer` 根据 `OAUTH_ISSUER` 和 `OAUTH_AUDIENCE` 校验 JWT，并校验：
 
 ```text
 iss === OAUTH_ISSUER
 aud === OAUTH_AUDIENCE
 exp / nbf 有效
-scope 或 permissions 覆盖当前工具需要的权限
+scope 和 permissions 合并后覆盖当前工具需要的权限；未知工具名按 fail-closed 处理，要求全部配置 scope
 ```
 
 ### CORS 说明
