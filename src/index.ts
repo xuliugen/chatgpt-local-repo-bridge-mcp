@@ -23,7 +23,6 @@ async function main(): Promise<void> {
   logger.info(`排除目录: ${config.excludedDirs.join(', ')}`);
   logger.info(`排除文件: ${config.excludedFilePatterns.join(', ')}`);
   logger.info(`CORS 来源: ${config.allowedOrigins.join(', ')}`);
-  logger.info(`认证: ${config.authToken ? '已启用' : '未启用'}`);
   logger.info(`终端工具: ${config.enableTerminal ? '已启用' : '已禁用'}`);
   logger.info('');
 

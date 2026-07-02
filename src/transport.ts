@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createMcpServer } from './server.js';
@@ -17,19 +17,6 @@ interface RateLimitRecord {
   count: number;
 }
 
-function isAuthorized(req: express.Request): boolean {
-  if (!config.authToken) return true;
-
-  const authorization = req.headers.authorization;
-  if (!authorization?.startsWith('Bearer ')) return false;
-
-  const suppliedToken = authorization.slice('Bearer '.length);
-  const expected = Buffer.from(config.authToken);
-  const supplied = Buffer.from(suppliedToken);
-
-  return expected.length === supplied.length && timingSafeEqual(expected, supplied);
-}
-
 function clientKey(req: express.Request): string {
   return req.ip || req.socket.remoteAddress || 'unknown';
 }
@@ -44,7 +31,7 @@ export function createApp(): express.Express {
   // JSON body 解析
   app.use(express.json({ limit: '2mb' }));
 
-  // CORS 配置。注意: CORS 不是鉴权；真正保护依赖可选 MCP_AUTH_TOKEN。
+  // CORS 配置
   app.use(
     cors({
       origin: config.allowedOrigins.includes('*')
@@ -110,16 +97,7 @@ export function createApp(): express.Express {
     next();
   }
 
-  function authenticate(req: express.Request, res: express.Response, next: express.NextFunction): void {
-    if (isAuthorized(req)) {
-      next();
-      return;
-    }
-
-    res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  app.use('/mcp', rateLimit, authenticate);
+  app.use('/mcp', rateLimit);
 
   // ===== MCP POST 端点 =====
   app.post('/mcp', async (req, res) => {
@@ -242,7 +220,6 @@ export function createApp(): express.Express {
         name: 'code-repo-mcp-server',
         version: '1.0.0',
         activeSessions: Object.keys(transports).length,
-        authEnabled: Boolean(config.authToken),
         terminalEnabled: config.enableTerminal,
       });
       return;

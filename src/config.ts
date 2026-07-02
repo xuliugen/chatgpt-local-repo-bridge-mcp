@@ -16,8 +16,6 @@ export interface AppConfig {
   excludedFilePatterns: string[];
   /** 允许的 CORS 来源 */
   allowedOrigins: string[];
-  /** 可选 Bearer token；配置后所有 /mcp 请求必须携带 Authorization: Bearer <token> */
-  authToken?: string;
   /** 是否注册任意命令执行工具 */
   enableTerminal: boolean;
   /** 是否允许 run_command 执行任意命令；默认 false，建议只使用 allowedCommands */
@@ -111,7 +109,6 @@ export function loadConfig(): AppConfig {
     allowedOrigins.push('https://chatgpt.com', 'https://chat.openai.com');
   }
 
-  const authToken = process.env.MCP_AUTH_TOKEN?.trim() || undefined;
   const enableTerminal = parseBoolean(process.env.ENABLE_TERMINAL, false);
   const allowAnyCommand = parseBoolean(process.env.ALLOW_ANY_COMMAND, false);
   const allowedCommands = parseList(process.env.ALLOWED_COMMANDS);
@@ -131,7 +128,6 @@ export function loadConfig(): AppConfig {
     excludedDirs,
     excludedFilePatterns,
     allowedOrigins,
-    authToken,
     enableTerminal,
     allowAnyCommand,
     allowedCommands,
