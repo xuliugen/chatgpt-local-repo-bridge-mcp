@@ -68,7 +68,7 @@ Copy-Item .env.example .env
 
 ```env
 PORT=3100
-WORKSPACES=D:\CodeX\chatgpt-local-repo-bridge-mcp,D:\CodeX\mindx-agent
+WORKSPACES=.,../mindx-agent
 
 EXCLUDED_DIRS=node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,DS_Store,.qoder
 EXCLUDED_FILES=.env,.env.local,.env.development,.env.development.local,.env.production,.env.production.local,.env.test,.env.test.local,.env.staging,.env.staging.local,.envrc,.npmrc,.pypirc,*.pem,*.key,*.crt,*.cer,*.p12,*.pfx,id_rsa,id_rsa.*,id_ed25519,id_ed25519.*
@@ -83,7 +83,7 @@ OAUTH_SCOPES=repo:read,repo:write,repo:git
 EXPOSE_PUBLIC_INFO=false
 
 ENABLE_TERMINAL=false
-ALLOWED_COMMANDS=npm run build,npm test,git status
+ALLOWED_COMMANDS=npm run build,npm test,git status,npm run archive:mindx,npm run cover:mindx
 ALLOW_ANY_COMMAND=false
 ALLOW_GIT_FORCE_PUSH=false
 
@@ -277,13 +277,126 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 ```env
 ENABLE_TERMINAL=true
-ALLOWED_COMMANDS=npm run build,npm test,git status
+ALLOWED_COMMANDS=npm run build,npm test,git status,npm run archive:mindx,npm run cover:mindx
 ALLOW_ANY_COMMAND=false
 ```
 
 默认只允许 `ALLOWED_COMMANDS` 中配置的完整命令。命令必须完整匹配，不能通过 `&&`、`&`、`;` 追加额外命令。只有设置 `ALLOW_ANY_COMMAND=true` 才允许任意命令。
 
 > 不建议在公网 ngrok 环境中设置 `ALLOW_ANY_COMMAND=true`。
+
+## 自定义脚本运行模式
+
+`run_command` 的推荐用法不是开放任意命令，而是在本项目中维护一组固定脚本，并通过 `npm run <script>` 暴露为可审计、可白名单控制的能力。
+
+### 设计原则
+
+1. 具体业务逻辑写在 `scripts/` 目录下，推荐使用 Node.js 脚本以兼容 Windows、macOS 和 Linux。
+2. `package.json` 只暴露稳定的 npm script 名称，例如 `npm run archive:mindx`。
+3. `.env` 的 `ALLOWED_COMMANDS` 只配置完整 npm 命令，不直接配置复杂 shell 命令。
+4. 每次调用会变化的参数通过 `run_command` 的 `env` 字段传入，不拼接到 `command` 字符串里。
+5. 脚本内部应固定或校验所有高风险路径、下载 URL、文件大小、解压路径、覆盖策略等边界。
+6. 公网环境不要设置 `ALLOW_ANY_COMMAND=true`。
+
+### 新增一个自定义脚本
+
+第一步，在 `scripts/` 下新增脚本，例如：
+
+```text
+scripts/example-task.mjs
+```
+
+第二步，在 `package.json` 中增加 npm script：
+
+```json
+{
+  "scripts": {
+    "example:task": "node scripts/example-task.mjs"
+  }
+}
+```
+
+第三步，把完整 npm 命令加入 `ALLOWED_COMMANDS`：
+
+```env
+ALLOWED_COMMANDS=npm run build,npm test,git status,npm run example:task
+```
+
+第四步，通过 MCP 调用：
+
+```text
+command: npm run example:task
+cwd: <项目根目录>
+```
+
+如果脚本需要动态参数，不要写成：
+
+```text
+command: npm run example:task -- https://example.com/file.zip
+```
+
+应改为通过 `env` 传入：
+
+```text
+command: npm run example:task
+cwd: <项目根目录>
+env:
+  INPUT_URL=https://example.com/file.zip
+  MODE=overlay
+```
+
+### 脚本安全要求
+
+自定义脚本至少应做到：
+
+1. 固定允许操作的根目录，禁止从用户输入直接决定任意文件路径。
+2. 下载类脚本只允许 HTTPS，并拒绝 localhost、内网地址和私有 IP，避免 SSRF。
+3. 解压 zip 前检查 entry，拒绝绝对路径、`..`、盘符路径，避免 zip slip。
+4. 拒绝写入 `.env*`、密钥、证书、SSH 私钥、`.git`、`node_modules` 等高风险内容。
+5. 覆盖目录前先备份；删除型操作必须显式开启，例如用 `MODE=mirror`。
+6. 限制输入文件大小、输出文件大小和保留数量。
+7. 输出清晰摘要，包括输入、输出、备份路径、文件大小和校验值。
+
+### 当前示例脚本
+
+本仓库当前内置了两个示例脚本，用于演示如何用固定脚本实现较复杂的文件处理流程：
+
+| npm script | 脚本 | 说明 |
+|-----------|------|------|
+| `npm run archive:mindx` | `scripts/archive-mindx-agent.mjs` | 示例：归档兄弟目录 `../mindx-agent` 并输出受控下载链接 |
+| `npm run cover:mindx` | `scripts/import-latest-mindx-agent.mjs` | 示例：读取 `.incoming` 中最新上传的 `mindx-agent-safe-*.zip`，校验、解压、备份并覆盖兄弟目录 `../mindx-agent` |
+
+这两个脚本只是“自定义脚本运行模式”的一个实现示例，不是 MCP 协议或服务端的通用上传/下载 tool。`npm run cover:mindx` 的查找最新上传 zip、校验、解压、备份和覆盖逻辑都集中在 `scripts/import-latest-mindx-agent.mjs` 中。
+
+### 上传 zip 后导入覆盖
+
+服务提供受 token 保护的上传入口，用于把 zip 上传到本项目的 `.incoming` 目录：
+
+```powershell
+curl.exe -X POST "https://consuela-trisyllabical-meetly.ngrok-free.dev/uploads/artifacts/mindx-agent-safe.zip?token=mindx-agent-download-token-20260703-local-only-change-before-sharing" `
+  -H "Content-Type: application/zip" `
+  --data-binary "@D:\path\to\mindx-agent-safe.zip"
+```
+
+上传成功后，服务端会给实际保存的文件名追加日期后缀，并在响应中返回 `fileName`，格式类似：
+
+```json
+{
+  "originalFileName": "mindx-agent-safe.zip",
+  "fileName": "mindx-agent-safe-20260703-101530-123.zip",
+  "sizeBytes": 1051344,
+  "uploadPath": "..."
+}
+```
+
+然后通过固定脚本覆盖导入：
+
+```text
+command: npm run cover:mindx
+cwd: <项目根目录>
+```
+
+导入脚本会读取 `.incoming` 中最新的 `mindx-agent-safe-*.zip`，检查 zip 路径安全性，备份当前 `../mindx-agent` 到 `.backups`，然后覆盖复制到 `../mindx-agent`。
 
 ## 安全机制
 
@@ -408,6 +521,8 @@ src/
 ├── server.ts                   # MCP Server 创建与 Tool 注册
 ├── transport.ts                # Streamable HTTP 传输层、限流、session 管理
 ├── config.ts                   # 配置管理和 workspace 校验
+├── routes/
+│   └── artifacts.ts            # 通用脚本产物下载路由
 ├── tools/
 │   ├── filesystem.ts           # 文件系统工具 (8)
 │   ├── search.ts               # 搜索工具 (3)，支持 ripgrep + Node fallback

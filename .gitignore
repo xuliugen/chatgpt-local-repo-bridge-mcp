@@ -4,3 +4,6 @@ dist/
 *.log
 .qoder/
 .DS_Store
+.artifacts/
+.incoming/
+.backups/

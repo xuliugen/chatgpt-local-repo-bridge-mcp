@@ -7,6 +7,7 @@ import { createMcpServer } from './server.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
 import { protectedResourceMetadata, requireOAuth } from './auth/oauth.js';
+import { registerArtifactRoutes } from './routes/artifacts.js';
 
 interface SessionRecord {
   transport: StreamableHTTPServerTransport;
@@ -193,6 +194,8 @@ export function createApp(): express.Express {
 
     res.json(protectedResourceMetadata());
   });
+
+  registerArtifactRoutes(app);
 
   app.use('/mcp', (req, res, next) => {
     const startedAt = Date.now();
@@ -417,6 +420,9 @@ export function createApp(): express.Express {
       endpoints: {
         mcp: 'POST/GET/DELETE /mcp - MCP Streamable HTTP endpoint',
         oauthProtectedResource: 'GET /.well-known/oauth-protected-resource - OAuth protected resource metadata',
+        artifactUpload: 'POST /uploads/artifacts/:filename?token=... - upload zip artifact into .incoming',
+
+        artifactDownload: 'GET /downloads/artifacts/:filename?token=... - script artifact download endpoint',
         health: 'GET /health - Health check',
       },
       tools: [
