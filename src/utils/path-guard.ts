@@ -14,6 +14,11 @@ interface WorkspaceMatch {
   realRoot: string;
 }
 
+interface FilePatternMatcher {
+  pattern: string;
+  regex: RegExp;
+}
+
 /**
  * 将输入路径解析为绝对路径
  */
@@ -79,41 +84,49 @@ function isPathInside(child: string, parent: string): boolean {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function getMatchedWorkspace(targetPath: string): WorkspaceMatch | null {
-  const canonicalTarget = canonicalizeTarget(targetPath);
+function escapeRegex(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
 
-  for (const workspace of config.workspaces) {
-    const realRoot = canonicalizeWorkspace(workspace);
-    if (isPathInside(canonicalTarget, realRoot)) {
-      return { configuredRoot: workspace, realRoot };
+function simpleGlobToRegex(pattern: string): RegExp {
+  const normalizedPattern = pattern.toLowerCase();
+  return new RegExp(`^${escapeRegex(normalizedPattern).replace(/\*/g, '.*')}$`);
+}
+
+const workspaceMatches: WorkspaceMatch[] = config.workspaces.map((workspace) => ({
+  configuredRoot: workspace,
+  realRoot: canonicalizeWorkspace(workspace),
+}));
+
+const excludedDirSet = new Set(config.excludedDirs);
+const excludedFileMatchers: FilePatternMatcher[] = config.excludedFilePatterns.map((pattern) => ({
+  pattern,
+  regex: simpleGlobToRegex(pattern),
+}));
+
+function getMatchedWorkspace(canonicalTarget: string): WorkspaceMatch | null {
+  for (const workspace of workspaceMatches) {
+    if (isPathInside(canonicalTarget, workspace.realRoot)) {
+      return workspace;
     }
   }
 
   return null;
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
-}
-
-function matchesSimpleGlob(fileName: string, pattern: string): boolean {
-  const normalizedName = fileName.toLowerCase();
-  const normalizedPattern = pattern.toLowerCase();
-  const regex = new RegExp(`^${escapeRegex(normalizedPattern).replace(/\*/g, '.*')}$`);
-  return regex.test(normalizedName);
+function matchesFilePattern(fileName: string, matcher: FilePatternMatcher): boolean {
+  return matcher.regex.test(fileName.toLowerCase());
 }
 
 function assertFileNotExcluded(targetPath: string): void {
-  if (config.excludedFilePatterns.length === 0) return;
+  if (excludedFileMatchers.length === 0) return;
 
   const baseName = path.basename(targetPath);
-  const matchedPattern = config.excludedFilePatterns.find((pattern) =>
-    matchesSimpleGlob(baseName, pattern)
-  );
+  const matched = excludedFileMatchers.find((matcher) => matchesFilePattern(baseName, matcher));
 
-  if (matchedPattern) {
+  if (matched) {
     throw new Error(
-      `路径 "${targetPath}" 匹配被排除的敏感文件模式 "${matchedPattern}"。\n` +
+      `路径 "${targetPath}" 匹配被排除的敏感文件模式 "${matched.pattern}"。\n` +
         `被排除的文件模式: ${config.excludedFilePatterns.join(', ')}`
     );
   }
@@ -126,7 +139,7 @@ function assertFileNotExcluded(targetPath: string): void {
 export function assertPathAllowed(targetPath: string): void {
   const resolved = resolvePath(targetPath);
   const canonicalTarget = canonicalizeTarget(resolved);
-  const matchedWorkspace = getMatchedWorkspace(resolved);
+  const matchedWorkspace = getMatchedWorkspace(canonicalTarget);
 
   if (!matchedWorkspace) {
     throw new Error(
@@ -135,7 +148,7 @@ export function assertPathAllowed(targetPath: string): void {
     );
   }
 
-  assertPathNotExcluded(canonicalTarget, matchedWorkspace.realRoot);
+  assertPathNotExcluded(canonicalTarget, matchedWorkspace.realRoot, true);
 }
 
 /**
@@ -144,10 +157,9 @@ export function assertPathAllowed(targetPath: string): void {
 export function assertNotWorkspaceRoot(targetPath: string, operation: string): void {
   const canonicalTarget = canonicalizeTarget(targetPath);
 
-  for (const workspace of config.workspaces) {
-    const realRoot = canonicalizeWorkspace(workspace);
-    if (canonicalTarget === realRoot) {
-      throw new Error(`${operation} 被拒绝: 不允许直接操作工作区根目录 "${workspace}"`);
+  for (const workspace of workspaceMatches) {
+    if (canonicalTarget === workspace.realRoot) {
+      throw new Error(`${operation} 被拒绝: 不允许直接操作工作区根目录 "${workspace.configuredRoot}"`);
     }
   }
 }
@@ -156,17 +168,20 @@ export function assertNotWorkspaceRoot(targetPath: string, operation: string): v
  * 检查路径是否包含被排除的目录段或敏感文件名
  * @throws Error 如果路径包含被排除目录或敏感文件
  */
-export function assertPathNotExcluded(targetPath: string, workspaceRoot: string): void {
-  const canonicalTarget = canonicalizeTarget(targetPath);
+export function assertPathNotExcluded(
+  targetPath: string,
+  workspaceRoot: string,
+  alreadyCanonical = false
+): void {
+  const canonicalTarget = alreadyCanonical ? targetPath : canonicalizeTarget(targetPath);
 
-  if (config.excludedDirs.length > 0) {
+  if (excludedDirSet.size > 0) {
     const relativePath = path.relative(workspaceRoot, canonicalTarget);
     if (relativePath && relativePath !== '.') {
       const segments = relativePath.split(path.sep);
-      const excludedSet = new Set(config.excludedDirs);
 
       for (const segment of segments) {
-        if (excludedSet.has(segment)) {
+        if (excludedDirSet.has(segment)) {
           throw new Error(
             `路径 "${targetPath}" 包含被排除的目录 "${segment}"。\n` +
               `被排除的目录: ${config.excludedDirs.join(', ')}`
@@ -183,14 +198,14 @@ export function assertPathNotExcluded(targetPath: string, workspaceRoot: string)
  * 检查目录名是否被排除 (用于遍历时过滤)
  */
 export function isDirExcluded(dirName: string): boolean {
-  return config.excludedDirs.includes(dirName);
+  return excludedDirSet.has(dirName);
 }
 
 /**
  * 检查文件名是否被排除 (用于遍历和搜索时过滤)
  */
 export function isFileExcluded(fileName: string): boolean {
-  return config.excludedFilePatterns.some((pattern) => matchesSimpleGlob(fileName, pattern));
+  return excludedFileMatchers.some((matcher) => matchesFilePattern(fileName, matcher));
 }
 
 /**

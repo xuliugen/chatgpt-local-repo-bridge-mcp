@@ -59,17 +59,19 @@ async function tryRipgrep(
     });
 
     const matches = stdout.trim().split('\n').filter(Boolean);
-    const lines = matches.map((line) => {
+    const shownMatches = matches.slice(0, limit);
+    const lines = shownMatches.map((line) => {
       const relativeLine = line.startsWith(base) ? path.relative(base, line) : line;
       return relativeLine;
     });
+    const truncated = matches.length > shownMatches.length;
 
     const output = [
       '[搜索引擎: ripgrep]',
       `搜索正则: ${pattern}`,
       `搜索目录: ${base}`,
       `文件过滤: ${filePattern || '(所有文件)'}`,
-      `找到 ${matches.length} 处匹配:`,
+      `找到 ${matches.length} 处匹配${truncated ? ` (显示前 ${shownMatches.length} 处)` : ''}:`,
       '',
       ...lines,
     ];

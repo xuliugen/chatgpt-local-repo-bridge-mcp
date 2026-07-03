@@ -14,6 +14,8 @@ interface SessionRecord {
   createdAt: number;
   lastSeen: number;
   requestCount: number;
+  activeRequests: number;
+  activeStreams: number;
 }
 
 interface RateLimitRecord {
@@ -94,6 +96,24 @@ export function createApp(): express.Express {
     return Object.keys(transports).length;
   }
 
+  function hasActiveSessionWork(record: SessionRecord): boolean {
+    return record.activeRequests > 0 || record.activeStreams > 0;
+  }
+
+  function finishSessionRequest(sessionId: string): void {
+    const record = transports[sessionId];
+    if (!record) return;
+    record.activeRequests = Math.max(0, record.activeRequests - 1);
+    record.lastSeen = Date.now();
+  }
+
+  function finishSessionStream(sessionId: string): void {
+    const record = transports[sessionId];
+    if (!record) return;
+    record.activeStreams = Math.max(0, record.activeStreams - 1);
+    record.lastSeen = Date.now();
+  }
+
   function closeSession(sessionId: string, reason: string): void {
     const record = transports[sessionId];
     if (!record) return;
@@ -104,7 +124,7 @@ export function createApp(): express.Express {
     const idleMs = now - record.lastSeen;
     const ageMs = now - record.createdAt;
     logger.warn(
-      `MCP 会话已回收: session=${shortSessionId(sessionId)} reason=${reason} idleMs=${idleMs} ageMs=${ageMs} requestCount=${record.requestCount} activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
+      `MCP 会话已回收: session=${shortSessionId(sessionId)} reason=${reason} idleMs=${idleMs} ageMs=${ageMs} requestCount=${record.requestCount} activeRequests=${record.activeRequests} activeStreams=${record.activeStreams} activeSessions=${activeSessionCount()} maxSessions=${config.maxSessions}`
     );
 
     void record.transport.close().catch((error) => {
@@ -115,7 +135,7 @@ export function createApp(): express.Express {
   function cleanupSessions(): void {
     const now = Date.now();
     for (const [sessionId, record] of Object.entries(transports)) {
-      if (now - record.lastSeen > config.sessionTtlMs) {
+      if (!hasActiveSessionWork(record) && now - record.lastSeen > config.sessionTtlMs) {
         closeSession(sessionId, 'idle_timeout');
       }
     }
@@ -129,7 +149,7 @@ export function createApp(): express.Express {
 
     const now = Date.now();
     const reclaimableSessionIds = Object.entries(transports)
-      .filter(([, record]) => now - record.lastSeen >= config.sessionLimitReclaimIdleMs)
+      .filter(([, record]) => !hasActiveSessionWork(record) && now - record.lastSeen >= config.sessionLimitReclaimIdleMs)
       .sort(([, left], [, right]) => left.lastSeen - right.lastSeen)
       .slice(0, overflowCount)
       .map(([sessionId]) => sessionId);
@@ -237,8 +257,9 @@ export function createApp(): express.Express {
         const record = transports[sessionId];
         record.lastSeen = Date.now();
         record.requestCount += 1;
+        record.activeRequests += 1;
         logger.info(
-          `复用 MCP 会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+          `复用 MCP 会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeRequests=${record.activeRequests} activeStreams=${record.activeStreams} activeSessions=${activeSessionCount()}`
         );
         transport = record.transport;
       } else if (!sessionId && isInitializeRequest(req.body)) {
@@ -269,9 +290,11 @@ export function createApp(): express.Express {
               createdAt: now,
               lastSeen: now,
               requestCount: 1,
+              activeRequests: 1,
+              activeStreams: 0,
             };
             logger.info(
-              `MCP 会话已初始化: session=${shortSessionId(sid)} activeSessions=${activeSessionCount()} requestCount=1`
+              `MCP 会话已初始化: session=${shortSessionId(sid)} activeSessions=${activeSessionCount()} requestCount=1 activeRequests=1 activeStreams=0`
             );
           },
         });
@@ -281,7 +304,7 @@ export function createApp(): express.Express {
           const record = sid ? transports[sid] : undefined;
           if (sid && record) {
             logger.info(
-              `MCP transport 已关闭: session=${shortSessionId(sid)} ageMs=${Date.now() - record.createdAt} requestCount=${record.requestCount}`
+              `MCP transport 已关闭: session=${shortSessionId(sid)} ageMs=${Date.now() - record.createdAt} requestCount=${record.requestCount} activeRequests=${record.activeRequests} activeStreams=${record.activeStreams}`
             );
             delete transports[sid];
           } else {
@@ -292,7 +315,12 @@ export function createApp(): express.Express {
         const server = createMcpServer();
         await server.connect(transport);
 
-        await transport.handleRequest(req as any, res, req.body);
+        try {
+          await transport.handleRequest(req as any, res, req.body);
+        } finally {
+          const initializedSessionId = transport.sessionId;
+          if (initializedSessionId) finishSessionRequest(initializedSessionId);
+        }
         return;
       } else {
         logger.warn(
@@ -309,7 +337,11 @@ export function createApp(): express.Express {
         return;
       }
 
-      await transport.handleRequest(req as any, res, req.body);
+      try {
+        await transport.handleRequest(req as any, res, req.body);
+      } finally {
+        if (sessionId) finishSessionRequest(sessionId);
+      }
     } catch (error) {
       logger.error('处理 MCP 请求时出错:', error);
       if (!res.headersSent) {
@@ -335,13 +367,23 @@ export function createApp(): express.Express {
     }
 
     const record = transports[sessionId];
+    record.lastSeen = Date.now();
     record.requestCount += 1;
+    record.activeStreams += 1;
     logger.info(
-      `建立 SSE 连接: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+      `建立 SSE 连接: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeRequests=${record.activeRequests} activeStreams=${record.activeStreams} activeSessions=${activeSessionCount()}`
     );
 
+    let streamFinished = false;
+    const finishStreamOnce = () => {
+      if (streamFinished) return;
+      streamFinished = true;
+      finishSessionStream(sessionId);
+    };
+    res.once('finish', finishStreamOnce);
+    res.once('close', finishStreamOnce);
+
     try {
-      record.lastSeen = Date.now();
       const transport = record.transport;
       await transport.handleRequest(req as any, res);
     } catch (error) {
@@ -362,13 +404,14 @@ export function createApp(): express.Express {
     }
 
     const record = transports[sessionId];
+    record.lastSeen = Date.now();
     record.requestCount += 1;
+    record.activeRequests += 1;
     logger.info(
-      `终止会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeSessions=${activeSessionCount()}`
+      `终止会话: session=${shortSessionId(sessionId)} requestCount=${record.requestCount} activeRequests=${record.activeRequests} activeStreams=${record.activeStreams} activeSessions=${activeSessionCount()}`
     );
 
     try {
-      record.lastSeen = Date.now();
       const transport = record.transport;
       await transport.handleRequest(req as any, res);
     } catch (error) {
@@ -376,6 +419,8 @@ export function createApp(): express.Express {
       if (!res.headersSent) {
         res.status(500).json({ error: 'Error processing session termination' });
       }
+    } finally {
+      finishSessionRequest(sessionId);
     }
   });
 
@@ -421,7 +466,6 @@ export function createApp(): express.Express {
         mcp: 'POST/GET/DELETE /mcp - MCP Streamable HTTP endpoint',
         oauthProtectedResource: 'GET /.well-known/oauth-protected-resource - OAuth protected resource metadata',
         artifactUpload: 'POST /uploads/artifacts/:filename?token=... - upload zip artifact into .incoming',
-
         artifactDownload: 'GET /downloads/artifacts/:filename?token=... - script artifact download endpoint',
         health: 'GET /health - Health check',
       },
