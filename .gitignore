@@ -7,5 +7,3 @@ dist/
 .artifacts/
 .incoming/
 .backups/
-scripts/install-chatgpt-local-repo-mcp-startup.ps1
-scripts/start-chatgpt-local-repo-mcp.ps1
