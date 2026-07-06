@@ -27,7 +27,7 @@ ChatGPT 网页端 (chatgpt.com)
 |  └── git         (9)                         |
 |                                              |
 |  可选高风险 Tools                            |
-|  └── terminal    (1, ENABLE_TERMINAL=true)   |
+|  └── terminal    (4, ENABLE_TERMINAL=true)   |
 |                                              |
 |  安全层                                      |
 |  ├── 工作区路径白名单                         |
@@ -70,7 +70,9 @@ Copy-Item .env.example .env
 PORT=3100
 WORKSPACES=.,../mindx-agent
 
-EXCLUDED_DIRS=node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,DS_Store,.qoder
+EXCLUDED_DIRS=.git
+ACCESS_BLOCKED_DIRS=
+TRAVERSAL_IGNORED_DIRS=
 EXCLUDED_FILES=.env,.env.local,.env.development,.env.development.local,.env.production,.env.production.local,.env.test,.env.test.local,.env.staging,.env.staging.local,.envrc,.npmrc,.pypirc,*.pem,*.key,*.crt,*.cer,*.p12,*.pfx,id_rsa,id_rsa.*,id_ed25519,id_ed25519.*
 ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
 
@@ -230,7 +232,7 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 ## 工具列表
 
-默认注册 20 个工具；当 `ENABLE_TERMINAL=true` 时额外注册 1 个高风险终端工具，总计 21 个。
+默认注册 20 个工具；当 `ENABLE_TERMINAL=true` 时额外注册 4 个高风险终端工具，总计 24 个。
 
 ### 文件系统工具 (8 个)
 
@@ -271,7 +273,10 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 | Tool | 功能 | 关键参数 | 安全属性 |
 |------|------|----------|----------|
-| `run_command` | 执行 shell 命令 | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
+| `run_command` | 执行 shell 命令，命令结束后一次性返回输出 | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
+| `run_command_start` | 启动后台 shell 命令并立即返回 `jobId` | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
+| `run_command_read` | 按 `offset` 增量读取后台命令输出 | `jobId`, `offset?`, `maxBytes?` | 读取后台 job 输出 |
+| `run_command_cancel` | 取消仍在运行的后台命令 | `jobId` | 高风险，open world + destructive |
 
 启用方式：
 
@@ -282,6 +287,8 @@ ALLOW_ANY_COMMAND=false
 ```
 
 默认只允许 `ALLOWED_COMMANDS` 中配置的完整命令。命令必须完整匹配，不能通过 `&&`、`&`、`;` 追加额外命令。只有设置 `ALLOW_ANY_COMMAND=true` 才允许任意命令。
+
+长命令推荐使用 `run_command_start` / `run_command_read` / `run_command_cancel`：`start` 会快速返回 `jobId`，后台命令继续执行；`read` 每次返回当前可用的增量输出和 `nextOffset`，直到 `done=true`；`cancel` 可取消仍在运行的 job。后台 job 当前限制为最多 5 个并发运行、单个 job 最多保留约 5MB 输出、结束后保留约 10 分钟。
 
 > 不建议在公网 ngrok 环境中设置 `ALLOW_ANY_COMMAND=true`。
 
@@ -410,12 +417,15 @@ cwd: <项目根目录>
 
 ### 排除目录和敏感文件
 
-`EXCLUDED_DIRS` 中的目录名在任意层级都会被拦截或跳过。
+目录控制拆分为两类：
 
-建议始终排除目录：
+- `EXCLUDED_DIRS` / `ACCESS_BLOCKED_DIRS`：强制禁止直接访问的目录名，匹配任意层级；默认包含 `.git`。
+- `TRAVERSAL_IGNORED_DIRS`：目录树、文件搜索、内容搜索默认忽略的高噪声目录；不阻止显式路径访问。
+
+默认遍历忽略目录包括：
 
 ```text
-node_modules,.git,dist,build,.next,__pycache__,.venv,.cache,coverage,.qoder
+node_modules,.git,dist,build,.next,.nuxt,__pycache__,.venv,.tox,venv,.cache,coverage,.qoder,.artifacts,.incoming,.backups,backs,.mcp-command-logs,.vite,.turbo,.parcel-cache,tmp,temp,logs
 ```
 
 `EXCLUDED_FILES` 用于拦截敏感文件 basename，默认包括：

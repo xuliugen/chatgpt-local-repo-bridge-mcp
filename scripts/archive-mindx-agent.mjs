@@ -19,6 +19,8 @@ const excludedDirectoryNames = [
   '.next',
   '.nuxt',
   '.cache',
+  '.mindx-agent',
+  '.claude',
   'coverage',
   '.venv',
   'venv',

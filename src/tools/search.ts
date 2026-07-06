@@ -12,6 +12,15 @@ import { glob } from 'glob';
 import { readOnlyLocalTool } from '../utils/tool-annotations.js';
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_TREE_MAX_ENTRIES = 300;
+const MAX_TREE_ENTRIES = 1000;
+
+interface TreeBuildState {
+  maxEntries: number;
+  entriesShown: number;
+  truncated: boolean;
+  omittedEntries: number;
+}
 
 function normalizeLimit(maxResults: number | undefined, defaultValue: number, maxValue: number): number {
   const value = maxResults ?? defaultValue;
@@ -39,7 +48,7 @@ async function tryRipgrep(
     '--no-heading',
     '--line-number',
     '--max-count', String(limit),
-    ...config.excludedDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
+    ...config.traversalIgnoredDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
     ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!${p}`]),
     ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!**/${p}`]),
   ];
@@ -126,7 +135,7 @@ async function nodeFallbackSearch(
     cwd: base,
     absolute: true,
     nodir: true,
-    ignore: config.excludedDirs
+    ignore: config.traversalIgnoredDirs
       .map((d) => `**/${d}/**`)
       .concat(config.excludedFilePatterns)
       .concat(config.excludedFilePatterns.map((p) => `**/${p}`))
@@ -203,7 +212,7 @@ export function registerSearchTools(server: McpServer): void {
         cwd: base,
         absolute: true,
         nodir: true,
-        ignore: config.excludedDirs
+        ignore: config.traversalIgnoredDirs
           .map((d) => `**/${d}/**`)
           .concat(config.excludedFilePatterns)
           .concat(config.excludedFilePatterns.map((p) => `**/${p}`)),
@@ -284,18 +293,44 @@ export function registerSearchTools(server: McpServer): void {
         path: z.string().describe('目录路径'),
         maxDepth: z.number().int().positive().max(10).optional().describe('最大递归深度，默认为 3，最高 10'),
         showHidden: z.boolean().optional().describe('是否显示隐藏文件 (以.开头的)，默认为 false'),
+        maxEntries: z.number().int().positive().max(MAX_TREE_ENTRIES).optional().describe('最大返回条目数，默认为 300，最高 1000'),
       },
     },
-    async ({ path: dirPath, maxDepth, showHidden }): Promise<CallToolResult> => {
+    async ({ path: dirPath, maxDepth, showHidden, maxEntries }): Promise<CallToolResult> => {
       const resolved = resolvePath(dirPath);
       assertPathAllowed(resolved);
 
-      logger.info(`get_file_tree: ${resolved} (maxDepth=${maxDepth ?? 3})`);
+      const depthLimit = maxDepth ?? 3;
+      const entryLimit = normalizeLimit(maxEntries, DEFAULT_TREE_MAX_ENTRIES, MAX_TREE_ENTRIES);
+      logger.info(`get_file_tree: ${resolved} (maxDepth=${depthLimit}, maxEntries=${entryLimit})`);
 
-      const tree = await buildTree(resolved, maxDepth ?? 3, 0, showHidden ?? false);
+      const state: TreeBuildState = {
+        maxEntries: entryLimit,
+        entriesShown: 0,
+        truncated: false,
+        omittedEntries: 0,
+      };
+      const tree = await buildTree(resolved, depthLimit, 0, showHidden ?? false, state);
 
       return {
-        content: [{ type: 'text', text: `${resolved}\n${tree}` }],
+        content: [{
+          type: 'text',
+          text: [
+            'summary: 文件树构建完成',
+            'ok: true',
+            'type: file_tree',
+            `path: ${resolved}`,
+            `maxDepth: ${depthLimit}`,
+            `showHidden: ${showHidden ?? false}`,
+            `entriesShown: ${state.entriesShown}`,
+            `maxEntries: ${entryLimit}`,
+            `truncated: ${state.truncated}`,
+            `omittedEntries: ${state.omittedEntries}`,
+            '',
+            '[tree]',
+            tree || '(空目录)',
+          ].join('\n'),
+        }],
       };
     }
   );
@@ -306,7 +341,8 @@ async function buildTree(
   dirPath: string,
   maxDepth: number,
   currentDepth: number,
-  showHidden: boolean
+  showHidden: boolean,
+  state: TreeBuildState
 ): Promise<string> {
   if (currentDepth >= maxDepth) {
     return '';
@@ -339,18 +375,25 @@ async function buildTree(
   const indent = '│   '.repeat(currentDepth);
 
   for (let i = 0; i < sorted.length; i++) {
+    if (state.entriesShown >= state.maxEntries) {
+      state.truncated = true;
+      state.omittedEntries += sorted.length - i;
+      break;
+    }
+
     const entry = sorted[i];
     const isLast = i === sorted.length - 1;
     const prefix = isLast ? '└── ' : '├── ';
     const name = entry.isDirectory() ? `${entry.name}/` : entry.name;
 
     lines.push(`${indent}${prefix}${name}`);
+    state.entriesShown += 1;
 
     if (entry.isDirectory()) {
       const subDir = path.join(dirPath, entry.name);
       try {
         assertPathAllowed(subDir);
-        const subTree = await buildTree(subDir, maxDepth, currentDepth + 1, showHidden);
+        const subTree = await buildTree(subDir, maxDepth, currentDepth + 1, showHidden, state);
         if (subTree) {
           lines.push(subTree);
         }

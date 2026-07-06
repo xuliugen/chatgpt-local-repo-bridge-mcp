@@ -20,8 +20,10 @@ export interface AppConfig {
   oauthScopes: string[];
   /** 允许访问的工作区目录列表 (已解析为绝对路径) */
   workspaces: string[];
-  /** 排除的目录名列表 (匹配任意层级，如 node_modules, dist, .git 等) */
+  /** 强制禁止直接访问的目录名列表 (匹配任意层级，如 .git 等) */
   excludedDirs: string[];
+  /** 遍历和搜索时默认忽略的高噪声目录名列表，不阻止显式路径访问 */
+  traversalIgnoredDirs: string[];
   /** 排除的敏感文件名 / glob 模式列表，仅匹配 basename */
   excludedFilePatterns: string[];
   /** 允许的 CORS 来源 */
@@ -113,15 +115,32 @@ export function loadConfig(): AppConfig {
   const workspaces = (configuredWorkspaces.length > 0 ? configuredWorkspaces : [process.cwd()])
     .map(validateWorkspace);
 
-  const excludedDirs = parseList(process.env.EXCLUDED_DIRS);
-  // 默认排除常见不需要访问或高风险的目录/文件夹名
-  if (excludedDirs.length === 0) {
-    excludedDirs.push(
-      'node_modules', '.git', 'dist', 'build',
-      '.next', '.nuxt', '__pycache__', '.venv',
-      '.tox', 'venv', '.cache', 'coverage', '.qoder'
-    );
-  }
+  const configuredExcludedDirs = parseList(process.env.EXCLUDED_DIRS);
+  const configuredAccessBlockedDirs = parseList(process.env.ACCESS_BLOCKED_DIRS);
+  const configuredTraversalIgnoredDirs = parseList(process.env.TRAVERSAL_IGNORED_DIRS);
+
+  // 访问阻断只用于真正的安全边界；默认不把构建产物、归档、日志目录变成不可读。
+  const defaultAccessBlockedDirs = ['.git'];
+  const excludedDirs = Array.from(new Set([
+    ...defaultAccessBlockedDirs,
+    ...configuredExcludedDirs,
+    ...configuredAccessBlockedDirs,
+  ]));
+
+  // 遍历忽略只用于 UI 降噪和搜索降噪；显式路径访问仍由工作区白名单和敏感文件规则控制。
+  const defaultTraversalIgnoredDirs = [
+    'node_modules', '.git', 'dist', 'build',
+    '.next', '.nuxt', '__pycache__', '.venv',
+    '.tox', 'venv', '.cache', 'coverage', '.qoder',
+    '.artifacts', '.incoming', '.backups', 'backs', '.mcp-command-logs',
+    '.vite', '.turbo', '.parcel-cache',
+    'tmp', 'temp', 'logs',
+  ];
+  const traversalIgnoredDirs = Array.from(new Set([
+    ...defaultTraversalIgnoredDirs,
+    ...configuredExcludedDirs,
+    ...configuredTraversalIgnoredDirs,
+  ]));
 
   const excludedFilePatterns = parseList(process.env.EXCLUDED_FILES);
   if (excludedFilePatterns.length === 0) {
@@ -162,6 +181,7 @@ export function loadConfig(): AppConfig {
     oauthScopes,
     workspaces,
     excludedDirs,
+    traversalIgnoredDirs,
     excludedFilePatterns,
     allowedOrigins,
     enableTerminal,

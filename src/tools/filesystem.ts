@@ -14,8 +14,56 @@ import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { destructiveLocalTool, readOnlyLocalTool, writeLocalTool } from '../utils/tool-annotations.js';
 
+const DEFAULT_READ_LINES = 500;
+const MAX_READ_LINES = 1000;
+const DEFAULT_LIST_MAX_ENTRIES = 300;
+const MAX_LIST_ENTRIES = 1000;
+
+interface DirectoryListState {
+  maxEntries: number;
+  lines: string[];
+  truncated: boolean;
+  omittedEntries: number;
+}
+
 function byteLength(content: string): number {
   return Buffer.byteLength(content, 'utf-8');
+}
+
+function normalizePositiveInt(value: number | undefined, defaultValue: number, maxValue: number): number {
+  if (value === undefined || !Number.isFinite(value)) return defaultValue;
+  return Math.min(Math.max(Math.floor(value), 1), maxValue);
+}
+
+function textResult(text: string, isError = false): CallToolResult {
+  return {
+    content: [{ type: 'text', text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function formatFieldValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
+function structuredTextResult(
+  summary: string,
+  fields: Record<string, unknown>,
+  bodyLabel?: string,
+  body?: string,
+  isError = false
+): CallToolResult {
+  const lines = [
+    `summary: ${summary}`,
+    ...Object.entries(fields).map(([key, value]) => `${key}: ${formatFieldValue(value)}`),
+  ];
+
+  if (bodyLabel && body !== undefined) {
+    lines.push('', `[${bodyLabel}]`, body || '(空)');
+  }
+
+  return textResult(lines.join('\n'), isError);
 }
 
 async function assertReadableTextFile(resolved: string): Promise<void> {
@@ -46,23 +94,45 @@ export function registerFilesystemTools(server: McpServer): void {
     'list_directory',
     {
       title: 'List Directory',
-      description: '列出指定目录的内容，包括文件和子目录。可选择递归列出。递归模式最多展开 2 层。',
+      description: '列出指定目录的内容，包括文件和子目录。可选择递归列出。递归模式最多展开 2 层，默认最多返回 300 个条目。',
       annotations: readOnlyLocalTool,
       inputSchema: {
         path: z.string().describe('要列出的目录路径'),
         recursive: z.boolean().optional().describe('是否递归列出子目录，默认为 false'),
+        maxEntries: z.number().int().positive().max(MAX_LIST_ENTRIES).optional().describe('最大返回条目数，默认为 300，最高 1000'),
       },
     },
-    async ({ path: dirPath, recursive }): Promise<CallToolResult> => {
+    async ({ path: dirPath, recursive, maxEntries }): Promise<CallToolResult> => {
       const resolved = resolvePath(dirPath);
       assertPathAllowed(resolved);
 
-      logger.info(`list_directory: ${resolved} (recursive=${recursive})`);
+      const limit = normalizePositiveInt(maxEntries, DEFAULT_LIST_MAX_ENTRIES, MAX_LIST_ENTRIES);
+      logger.info(`list_directory: ${resolved} (recursive=${recursive}, maxEntries=${limit})`);
 
-      const entries = await listDir(resolved, recursive ?? false, 0, 2);
-      return {
-        content: [{ type: 'text', text: entries }],
+      const state: DirectoryListState = {
+        maxEntries: limit,
+        lines: [],
+        truncated: false,
+        omittedEntries: 0,
       };
+      await listDir(resolved, recursive ?? false, 0, 2, state);
+
+      return structuredTextResult(
+        '目录列举完成',
+        {
+          ok: true,
+          type: 'directory_list',
+          path: resolved,
+          recursive: recursive ?? false,
+          maxDepth: recursive ? 2 : 0,
+          entriesShown: state.lines.length,
+          maxEntries: limit,
+          truncated: state.truncated,
+          omittedEntries: state.omittedEntries,
+        },
+        'entries',
+        state.lines.join('\n')
+      );
     }
   );
 
@@ -73,16 +143,17 @@ export function registerFilesystemTools(server: McpServer): void {
       title: 'Read File',
       description:
         '读取指定文本文件内容。支持按行号范围读取部分内容。' +
-        '默认只读取前 500 行，且受 MAX_READ_BYTES 大小上限保护。' +
+        '默认只读取前 500 行，单次最多 1000 行，且受 MAX_READ_BYTES 大小上限保护。' +
         '返回内容带有行号前缀，方便后续用 edit_file 定位。',
       annotations: readOnlyLocalTool,
       inputSchema: {
         path: z.string().describe('要读取的文件路径'),
         startLine: z.number().int().positive().optional().describe('起始行号 (1-based)，不指定则从头开始'),
-        endLine: z.number().int().positive().optional().describe('结束行号 (1-based)，默认为 500'),
+        endLine: z.number().int().positive().optional().describe('结束行号 (1-based)，不指定则按 maxLines 限制读取'),
+        maxLines: z.number().int().positive().max(MAX_READ_LINES).optional().describe('本次最多读取的行数，默认为 500，最高 1000'),
       },
     },
-    async ({ path: filePath, startLine, endLine }): Promise<CallToolResult> => {
+    async ({ path: filePath, startLine, endLine, maxLines }): Promise<CallToolResult> => {
       const resolved = resolvePath(filePath);
       assertPathAllowed(resolved);
       await assertReadableTextFile(resolved);
@@ -91,40 +162,71 @@ export function registerFilesystemTools(server: McpServer): void {
       const allLines = allContent.split('\n');
       const totalLines = allLines.length;
 
-      const start = (startLine ?? 1) - 1;
-      const requestedEnd = endLine ?? 500;
-      const end = Math.min(requestedEnd, totalLines);
+      const start = startLine ?? 1;
+      const lineLimit = normalizePositiveInt(maxLines, DEFAULT_READ_LINES, MAX_READ_LINES);
+      const requestedEnd = endLine ?? start + lineLimit - 1;
+      const cappedEnd = Math.min(requestedEnd, start + lineLimit - 1, totalLines);
+      const truncated = cappedEnd < Math.min(requestedEnd, totalLines);
 
-      if (start >= totalLines) {
-        return {
-          content: [{ type: 'text', text: `读取失败: startLine=${startLine} 超出文件总行数 ${totalLines}` }],
-          isError: true,
-        };
+      if (start > totalLines) {
+        return structuredTextResult(
+          '读取失败: 起始行超出文件总行数',
+          {
+            ok: false,
+            type: 'file_range',
+            path: resolved,
+            startLine: start,
+            totalLines,
+          },
+          undefined,
+          undefined,
+          true
+        );
       }
 
-      if (start >= end) {
-        return {
-          content: [{ type: 'text', text: `读取失败: 行号范围无效 (startLine=${startLine ?? 1}, endLine=${requestedEnd})` }],
-          isError: true,
-        };
+      if (start > requestedEnd) {
+        return structuredTextResult(
+          '读取失败: 行号范围无效',
+          {
+            ok: false,
+            type: 'file_range',
+            path: resolved,
+            startLine: start,
+            endLine: requestedEnd,
+            totalLines,
+          },
+          undefined,
+          undefined,
+          true
+        );
       }
 
-      const selectedLines = allLines.slice(start, end);
-
-      logger.info(`read_file: ${resolved} (lines ${start + 1}-${end}/${totalLines})`);
-
+      const selectedLines = allLines.slice(start - 1, cappedEnd);
       const numberedLines = selectedLines.map(
-        (line, i) => `${String(start + i + 1).padStart(5)}\t${line}`
+        (line, i) => `${String(start + i).padStart(5)}\t${line}`
       );
+      const nextStartLine = cappedEnd < totalLines ? cappedEnd + 1 : null;
 
-      const header = `文件: ${resolved} (共 ${totalLines} 行，当前显示 ${start + 1}-${end} 行)`;
-      const footer = end < totalLines
-        ? `\n... 还有 ${totalLines - end} 行未显示，请设置 endLine 参数查看更多 ...`
-        : '';
+      logger.info(`read_file: ${resolved} (lines ${start}-${cappedEnd}/${totalLines}, maxLines=${lineLimit})`);
 
-      return {
-        content: [{ type: 'text', text: `${header}\n${numberedLines.join('\n')}${footer}` }],
-      };
+      return structuredTextResult(
+        '文件范围读取完成',
+        {
+          ok: true,
+          type: 'file_range',
+          path: resolved,
+          totalLines,
+          startLine: start,
+          endLine: cappedEnd,
+          requestedEndLine: requestedEnd,
+          maxLines: lineLimit,
+          truncated,
+          hasMore: nextStartLine !== null,
+          nextStartLine,
+        },
+        'content',
+        numberedLines.join('\n')
+      );
     }
   );
 
@@ -154,9 +256,12 @@ export function registerFilesystemTools(server: McpServer): void {
 
       await fs.writeFile(resolved, content, 'utf-8');
 
-      return {
-        content: [{ type: 'text', text: `文件已成功写入: ${resolved} (${byteLength(content)} 字节)` }],
-      };
+      return structuredTextResult('文件已成功写入', {
+        ok: true,
+        type: 'write_file',
+        path: resolved,
+        sizeBytes: byteLength(content),
+      });
     }
   );
 
@@ -205,10 +310,20 @@ export function registerFilesystemTools(server: McpServer): void {
           const end = edit.endLine;
 
           if (start < 0 || end > lines.length || start >= end) {
-            return {
-              content: [{ type: 'text', text: `编辑失败: 行号范围无效 (startLine=${edit.startLine}, endLine=${edit.endLine}, 文件共 ${lines.length} 行)` }],
-              isError: true,
-            };
+            return structuredTextResult(
+              '编辑失败: 行号范围无效',
+              {
+                ok: false,
+                type: 'edit_file',
+                path: resolved,
+                startLine: edit.startLine,
+                endLine: edit.endLine,
+                totalLines: lines.length,
+              },
+              undefined,
+              undefined,
+              true
+            );
           }
 
           lines.splice(start, end - start, ...edit.newText.split('\n'));
@@ -219,17 +334,32 @@ export function registerFilesystemTools(server: McpServer): void {
           const count = joined.split(edit.oldText).length - 1;
 
           if (count === 0) {
-            return {
-              content: [{ type: 'text', text: `编辑失败: 未找到匹配的文本片段\n搜索内容:\n${edit.oldText}` }],
-              isError: true,
-            };
+            return structuredTextResult(
+              '编辑失败: 未找到匹配的文本片段',
+              {
+                ok: false,
+                type: 'edit_file',
+                path: resolved,
+              },
+              'searchText',
+              edit.oldText,
+              true
+            );
           }
 
           if (count > 1) {
-            return {
-              content: [{ type: 'text', text: `编辑失败: 文本片段匹配不唯一 (找到 ${count} 处)，请提供更多上下文或使用行号模式\n搜索内容:\n${edit.oldText}` }],
-              isError: true,
-            };
+            return structuredTextResult(
+              '编辑失败: 文本片段匹配不唯一',
+              {
+                ok: false,
+                type: 'edit_file',
+                path: resolved,
+                matchCount: count,
+              },
+              'searchText',
+              edit.oldText,
+              true
+            );
           }
 
           content = joined.replace(edit.oldText, edit.newText);
@@ -242,9 +372,17 @@ export function registerFilesystemTools(server: McpServer): void {
 
       await fs.writeFile(resolved, content, 'utf-8');
 
-      return {
-        content: [{ type: 'text', text: `文件已成功编辑: ${resolved}\n执行了 ${edits.length} 处替换:\n${appliedEdits.join('\n')}` }],
-      };
+      return structuredTextResult(
+        '文件已成功编辑',
+        {
+          ok: true,
+          type: 'edit_file',
+          path: resolved,
+          editCount: edits.length,
+        },
+        'appliedEdits',
+        appliedEdits.join('\n')
+      );
     }
   );
 
@@ -275,9 +413,12 @@ export function registerFilesystemTools(server: McpServer): void {
         await fs.unlink(resolved);
       }
 
-      return {
-        content: [{ type: 'text', text: `已成功删除: ${resolved}` }],
-      };
+      return structuredTextResult('已成功删除', {
+        ok: true,
+        type: 'delete_file',
+        path: resolved,
+        recursive: recursive ?? false,
+      });
     }
   );
 
@@ -301,9 +442,11 @@ export function registerFilesystemTools(server: McpServer): void {
 
       await fs.mkdir(resolved, { recursive: true });
 
-      return {
-        content: [{ type: 'text', text: `目录已创建: ${resolved}` }],
-      };
+      return structuredTextResult('目录已创建', {
+        ok: true,
+        type: 'create_directory',
+        path: resolved,
+      });
     }
   );
 
@@ -333,9 +476,12 @@ export function registerFilesystemTools(server: McpServer): void {
 
       await fs.rename(resolvedSrc, resolvedDst);
 
-      return {
-        content: [{ type: 'text', text: `已移动: ${resolvedSrc} -> ${resolvedDst}` }],
-      };
+      return structuredTextResult('已移动', {
+        ok: true,
+        type: 'move_file',
+        source: resolvedSrc,
+        destination: resolvedDst,
+      });
     }
   );
 
@@ -358,20 +504,18 @@ export function registerFilesystemTools(server: McpServer): void {
 
       const stats = await fs.lstat(resolved);
 
-      const info = {
+      return structuredTextResult('文件信息读取完成', {
+        ok: true,
+        type: 'file_info',
         path: resolved,
-        type: stats.isSymbolicLink() ? 'symlink' : stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : 'other',
+        fileType: stats.isSymbolicLink() ? 'symlink' : stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : 'other',
         size: formatSize(stats.size),
         sizeBytes: stats.size,
         created: stats.birthtime.toISOString(),
         modified: stats.mtime.toISOString(),
         accessed: stats.atime.toISOString(),
         permissions: `0${(stats.mode & 0o777).toString(8)}`,
-      };
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(info, null, 2) }],
-      };
+      });
     }
   );
 }
@@ -381,11 +525,11 @@ async function listDir(
   dirPath: string,
   recursive: boolean,
   depth: number,
-  maxDepth: number
-): Promise<string> {
+  maxDepth: number,
+  state: DirectoryListState
+): Promise<void> {
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
   const indent = '  '.repeat(depth);
-  const lines: string[] = [];
 
   const filtered = entries.filter((e) => {
     if (e.isDirectory() && isDirExcluded(e.name)) return false;
@@ -399,23 +543,29 @@ async function listDir(
     return a.name.localeCompare(b.name);
   });
 
-  for (const entry of sorted) {
+  for (let i = 0; i < sorted.length; i++) {
+    if (state.lines.length >= state.maxEntries) {
+      state.truncated = true;
+      state.omittedEntries += sorted.length - i;
+      break;
+    }
+
+    const entry = sorted[i];
     const prefix = entry.isDirectory() ? '📁 ' : '📄 ';
-    lines.push(`${indent}${prefix}${entry.name}`);
+    state.lines.push(`${indent}${prefix}${entry.name}`);
 
     if (recursive && entry.isDirectory() && depth < maxDepth) {
       const subDir = path.join(dirPath, entry.name);
       try {
         assertPathAllowed(subDir);
-        const subContent = await listDir(subDir, true, depth + 1, maxDepth);
-        if (subContent) lines.push(subContent);
+        await listDir(subDir, true, depth + 1, maxDepth, state);
       } catch {
-        lines.push(`${indent}  [权限不足，跳过]`);
+        if (state.lines.length < state.maxEntries) {
+          state.lines.push(`${indent}  [权限不足，跳过]`);
+        }
       }
     }
   }
-
-  return lines.join('\n');
 }
 
 function formatSize(bytes: number): string {

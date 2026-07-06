@@ -6,7 +6,7 @@ import { config } from '../config.js';
  * 路径安全守卫
  * - 确保文件操作在允许的工作区目录内
  * - 使用 realpath 防止 workspace 内 symlink 指向外部目录
- * - 阻止访问被排除目录和敏感文件
+ * - 阻止访问强制禁止目录和敏感文件
  */
 
 interface WorkspaceMatch {
@@ -98,7 +98,8 @@ const workspaceMatches: WorkspaceMatch[] = config.workspaces.map((workspace) => 
   realRoot: canonicalizeWorkspace(workspace),
 }));
 
-const excludedDirSet = new Set(config.excludedDirs);
+const accessBlockedDirSet = new Set(config.excludedDirs);
+const traversalIgnoredDirSet = new Set(config.traversalIgnoredDirs);
 const excludedFileMatchers: FilePatternMatcher[] = config.excludedFilePatterns.map((pattern) => ({
   pattern,
   regex: simpleGlobToRegex(pattern),
@@ -165,8 +166,8 @@ export function assertNotWorkspaceRoot(targetPath: string, operation: string): v
 }
 
 /**
- * 检查路径是否包含被排除的目录段或敏感文件名
- * @throws Error 如果路径包含被排除目录或敏感文件
+ * 检查路径是否包含强制禁止访问的目录段或敏感文件名
+ * @throws Error 如果路径包含强制禁止访问目录或敏感文件
  */
 export function assertPathNotExcluded(
   targetPath: string,
@@ -175,16 +176,16 @@ export function assertPathNotExcluded(
 ): void {
   const canonicalTarget = alreadyCanonical ? targetPath : canonicalizeTarget(targetPath);
 
-  if (excludedDirSet.size > 0) {
+  if (accessBlockedDirSet.size > 0) {
     const relativePath = path.relative(workspaceRoot, canonicalTarget);
     if (relativePath && relativePath !== '.') {
       const segments = relativePath.split(path.sep);
 
       for (const segment of segments) {
-        if (excludedDirSet.has(segment)) {
+        if (accessBlockedDirSet.has(segment)) {
           throw new Error(
-            `路径 "${targetPath}" 包含被排除的目录 "${segment}"。\n` +
-              `被排除的目录: ${config.excludedDirs.join(', ')}`
+            `路径 "${targetPath}" 包含强制禁止访问的目录 "${segment}"。\n` +
+              `强制禁止访问的目录: ${config.excludedDirs.join(', ')}`
           );
         }
       }
@@ -195,10 +196,10 @@ export function assertPathNotExcluded(
 }
 
 /**
- * 检查目录名是否被排除 (用于遍历时过滤)
+ * 检查目录名是否应在遍历和搜索时被忽略，不代表禁止显式路径访问。
  */
 export function isDirExcluded(dirName: string): boolean {
-  return excludedDirSet.has(dirName);
+  return traversalIgnoredDirSet.has(dirName);
 }
 
 /**

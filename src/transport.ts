@@ -475,7 +475,7 @@ export function createApp(): express.Express {
         'search_files', 'search_content', 'get_file_tree',
         'git_status', 'git_diff', 'git_log', 'git_add', 'git_commit',
         'git_branch', 'git_show', 'git_push', 'git_pull',
-        ...(config.enableTerminal ? ['run_command'] : []),
+        ...(config.enableTerminal ? ['run_command', 'run_command_start', 'run_command_read', 'run_command_cancel'] : []),
       ],
     });
   });

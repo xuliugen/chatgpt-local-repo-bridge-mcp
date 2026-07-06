@@ -36,12 +36,12 @@ export function createMcpServer(): McpServer {
 
   if (config.enableTerminal) {
     registerTerminalTools(server);
-    logger.warn('  - 终端工具 (1 个 Tool，已启用高风险命令执行能力)');
+    logger.warn('  - 终端工具 (4 个 Tools，已启用高风险命令执行能力)');
   } else {
     logger.info('  - 终端工具已禁用 (ENABLE_TERMINAL=false)');
   }
 
-  logger.info(`共注册 ${config.enableTerminal ? 21 : 20} 个 MCP Tools`);
+  logger.info(`共注册 ${config.enableTerminal ? 24 : 20} 个 MCP Tools`);
 
   return server;
 }
