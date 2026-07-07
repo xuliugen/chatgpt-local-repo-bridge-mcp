@@ -7,6 +7,7 @@ import { registerChangeTools } from './tools/changes.js';
 import { registerWorkspaceTools } from './tools/workspace.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+import { installToolTiming } from './tool-timing.js';
 
 function registerDefaultToolSet(server: McpServer): number {
   registerWorkspaceTools(server);
@@ -60,6 +61,7 @@ export function createMcpServer(): McpServer {
       },
     }
   );
+  installToolTiming(server);
 
   logger.info(`正在注册 MCP Tools... toolMode=${config.toolMode}`);
 
