@@ -16,8 +16,8 @@ const execAsync = promisify(exec);
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_ACTIVE_JOBS = 5;
 const MAX_JOB_OUTPUT_CHARS = 5 * 1024 * 1024;
-const DEFAULT_READ_CHARS = 64 * 1024;
-const MAX_READ_CHARS = 128 * 1024;
+const DEFAULT_READ_CHARS = 16 * 1024;
+const MAX_READ_CHARS = 64 * 1024;
 const FINISHED_JOB_TTL_MS = 10 * 60_000;
 const COMMAND_PREVIEW_CHARS = 16 * 1024;
 const COMMAND_LOG_DIR_NAME = '.mcp-command-logs';
@@ -83,6 +83,13 @@ function textResult(text: string, isError = false): CallToolResult {
   };
 }
 
+function stripAnsi(text: string): string {
+  return text.replace(
+    /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[a-zA-Z\d]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g,
+    ''
+  );
+}
+
 function formatFieldValue(value: unknown): string {
   if (typeof value === 'string') return value;
   return JSON.stringify(value);
@@ -111,13 +118,14 @@ function previewText(text: string | undefined, maxChars = COMMAND_PREVIEW_CHARS)
   chars: number;
   bytes: number;
 } {
-  const value = text ?? '';
+  const rawValue = text ?? '';
+  const value = stripAnsi(rawValue);
   if (value.length <= maxChars) {
     return {
       preview: value,
       truncated: false,
       chars: value.length,
-      bytes: Buffer.byteLength(value, 'utf-8'),
+      bytes: Buffer.byteLength(rawValue, 'utf-8'),
     };
   }
 
@@ -129,7 +137,7 @@ function previewText(text: string | undefined, maxChars = COMMAND_PREVIEW_CHARS)
     preview: `${value.slice(0, headChars)}\n\n...[truncated ${omittedChars} chars]...\n\n${value.slice(-tailChars)}`,
     truncated: true,
     chars: value.length,
-    bytes: Buffer.byteLength(value, 'utf-8'),
+    bytes: Buffer.byteLength(rawValue, 'utf-8'),
   };
 }
 
@@ -172,8 +180,13 @@ async function writeCommandLogFile(args: {
     error || '(空)',
   ].join('\n');
 
-  await fs.writeFile(logPath, logContent, 'utf-8');
-  return logPath;
+  try {
+    await fs.writeFile(logPath, logContent, 'utf-8');
+    return logPath;
+  } catch (error) {
+    logger.warn(`命令完整日志写入失败: ${(error as Error).message}`);
+    return null;
+  }
 }
 
 function formatCommandResult(args: {
@@ -193,6 +206,7 @@ function formatCommandResult(args: {
   const stdout = previewText(args.stdout);
   const stderr = previewText(args.stderr);
   const error = previewText(args.error, 4096);
+  const fullLogRequired = stdout.truncated || stderr.truncated || error.truncated;
 
   return structuredText(
     args.ok ? '命令执行成功' : '命令执行失败',
@@ -212,6 +226,10 @@ function formatCommandResult(args: {
       errorTruncated: error.truncated,
       logFilePath: args.logFilePath,
       fullLogSeparated: args.logFilePath !== null,
+      fullLogRequired,
+      nextHint: fullLogRequired && args.logFilePath
+        ? '输出预览已截断；请读取 logFilePath 获取完整日志后再下结论。'
+        : '输出预览未截断；如需审计完整 stdout/stderr，可读取 logFilePath。',
     },
     [
       { label: 'stdoutPreview', text: stdout.preview },
@@ -326,8 +344,9 @@ function formatJobRead(job: TerminalJob, requestedOffset: number | undefined, ma
   }
 
   const startIndex = readOffset - outputStart;
-  const output = job.output.slice(startIndex, startIndex + maxChars);
-  const nextOffset = readOffset + output.length;
+  const rawOutput = job.output.slice(startIndex, startIndex + maxChars);
+  const output = stripAnsi(rawOutput);
+  const nextOffset = readOffset + rawOutput.length;
   const done = job.status !== 'running' && nextOffset >= outputEnd;
 
   return structuredText(
@@ -347,6 +366,8 @@ function formatJobRead(job: TerminalJob, requestedOffset: number | undefined, ma
       error: job.errorMessage ?? null,
       truncatedChars: job.truncatedChars,
       warnings,
+      ansiStripped: rawOutput !== output,
+      maxChars,
     },
     [{ label: 'output', text: output || '(暂无新增输出)' }]
   );
@@ -588,7 +609,7 @@ export function registerTerminalTools(server: McpServer): void {
       inputSchema: {
         jobId: z.string().min(1).describe('run_command_start 返回的 jobId'),
         offset: z.number().int().nonnegative().optional().describe('从哪个输出偏移开始读取；首次读取可传 0 或不传'),
-        maxBytes: z.number().int().positive().max(MAX_READ_CHARS).optional().describe('本次最多读取的字符数，默认 65536，最高 131072'),
+        maxBytes: z.number().int().positive().max(MAX_READ_CHARS).optional().describe('本次最多读取的字符数，默认 16384，最高 65536'),
       },
     },
     async ({ jobId, offset, maxBytes }): Promise<CallToolResult> => {

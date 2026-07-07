@@ -14,12 +14,19 @@ import { readOnlyLocalTool } from '../utils/tool-annotations.js';
 const execFileAsync = promisify(execFile);
 const DEFAULT_TREE_MAX_ENTRIES = 300;
 const MAX_TREE_ENTRIES = 1000;
+const SEARCH_LINE_PREVIEW_CHARS = 800;
 
 interface TreeBuildState {
   maxEntries: number;
   entriesShown: number;
   truncated: boolean;
   omittedEntries: number;
+}
+
+interface SearchLinePreview {
+  text: string;
+  truncated: boolean;
+  originalChars: number;
 }
 
 function normalizeLimit(maxResults: number | undefined, defaultValue: number, maxValue: number): number {
@@ -34,6 +41,97 @@ function validateSearchPattern(pattern: string): string | null {
   return null;
 }
 
+function textResult(text: string, isError = false): CallToolResult {
+  return {
+    content: [{ type: 'text', text }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+function formatFieldValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
+function structuredTextResult(
+  summary: string,
+  fields: Record<string, unknown>,
+  bodyLabel?: string,
+  body?: string,
+  isError = false
+): CallToolResult {
+  const lines = [
+    `summary: ${summary}`,
+    ...Object.entries(fields).map(([key, value]) => `${key}: ${formatFieldValue(value)}`),
+  ];
+
+  if (bodyLabel && body !== undefined) {
+    lines.push('', `[${bodyLabel}]`, body || '(空)');
+  }
+
+  return textResult(lines.join('\n'), isError);
+}
+
+function getTraversalIgnoredDirsForBase(base: string): string[] {
+  const baseSegments = path.resolve(base).split(path.sep).filter(Boolean);
+  // 如果调用方显式把搜索根目录放在某个默认忽略目录内部，则不要再用该目录名过滤它自身。
+  return config.traversalIgnoredDirs.filter((dir) => !baseSegments.includes(dir));
+}
+
+function buildIgnoredScopeNote(ignoredDirs: string[]): string {
+  if (ignoredDirs.length === 0) {
+    return '未应用默认遍历忽略目录；通常表示搜索路径已经显式位于某个默认忽略目录内部。';
+  }
+
+  return '本次搜索默认跳过 ignoredDirs 中的目录；如果目标可能位于这些目录，请把搜索 path/basePath 显式指向对应目录后重试。';
+}
+
+function globIgnorePatterns(ignoredDirs: string[], includeLockFiles = false): string[] {
+  const patterns = ignoredDirs
+    .map((d) => `**/${d}/**`)
+    .concat(config.excludedFilePatterns)
+    .concat(config.excludedFilePatterns.map((p) => `**/${p}`));
+
+  if (includeLockFiles) {
+    patterns.push('**/*.lock');
+  }
+
+  return patterns;
+}
+
+function previewSearchLine(line: string): SearchLinePreview {
+  if (line.length <= SEARCH_LINE_PREVIEW_CHARS) {
+    return {
+      text: line,
+      truncated: false,
+      originalChars: line.length,
+    };
+  }
+
+  const headChars = Math.floor(SEARCH_LINE_PREVIEW_CHARS * 0.7);
+  const tailChars = Math.floor(SEARCH_LINE_PREVIEW_CHARS * 0.2);
+  const omittedChars = line.length - headChars - tailChars;
+
+  return {
+    text: `${line.slice(0, headChars)} ...[line truncated ${omittedChars} chars]... ${line.slice(-tailChars)}`,
+    truncated: true,
+    originalChars: line.length,
+  };
+}
+
+function formatSearchMatch(filePath: string, lineNumber: number, lineText: string, base: string): {
+  line: string;
+  lineTruncated: boolean;
+} {
+  const relativePath = path.relative(base, filePath) || path.basename(filePath);
+  const preview = previewSearchLine(lineText.trim());
+  const suffix = preview.truncated ? ` [lineTruncated=true originalChars=${preview.originalChars}]` : '';
+  return {
+    line: `${relativePath}:${lineNumber}: ${preview.text}${suffix}`,
+    lineTruncated: preview.truncated,
+  };
+}
+
 /**
  * 尝试使用 ripgrep 搜索 (高性能)
  * @returns 成功返回 CallToolResult，ripgrep 不可用返回 null
@@ -42,13 +140,15 @@ async function tryRipgrep(
   pattern: string,
   base: string,
   filePattern: string | undefined,
-  limit: number
+  limit: number,
+  ignoredDirs: string[]
 ): Promise<CallToolResult | null> {
   const args = [
+    '--color', 'never',
     '--no-heading',
     '--line-number',
     '--max-count', String(limit),
-    ...config.traversalIgnoredDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
+    ...ignoredDirs.flatMap((d) => ['--glob', `!**/${d}/**`]),
     ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!${p}`]),
     ...config.excludedFilePatterns.flatMap((p) => ['--glob', `!**/${p}`]),
   ];
@@ -70,35 +170,56 @@ async function tryRipgrep(
     const matches = stdout.trim().split('\n').filter(Boolean);
     const shownMatches = matches.slice(0, limit);
     const lines = shownMatches.map((line) => {
-      const relativeLine = line.startsWith(base) ? path.relative(base, line) : line;
-      return relativeLine;
+      const preview = previewSearchLine(line.startsWith(base) ? path.relative(base, line) : line);
+      return `${preview.text}${preview.truncated ? ` [lineTruncated=true originalChars=${preview.originalChars}]` : ''}`;
     });
     const truncated = matches.length > shownMatches.length;
+    const lineTruncatedCount = lines.filter((line) => line.includes('lineTruncated=true')).length;
 
-    const output = [
-      '[搜索引擎: ripgrep]',
-      `搜索正则: ${pattern}`,
-      `搜索目录: ${base}`,
-      `文件过滤: ${filePattern || '(所有文件)'}`,
-      `找到 ${matches.length} 处匹配${truncated ? ` (显示前 ${shownMatches.length} 处)` : ''}:`,
-      '',
-      ...lines,
-    ];
-
-    return {
-      content: [{ type: 'text', text: output.join('\n') }],
-    };
+    return structuredTextResult(
+      truncated ? '搜索完成，结果已截断' : '搜索完成',
+      {
+        ok: true,
+        type: 'search_content',
+        engine: 'ripgrep',
+        regex: pattern,
+        searchedPath: base,
+        filePattern: filePattern || null,
+        matchesCollected: matches.length,
+        matchesShown: shownMatches.length,
+        maxResults: limit,
+        truncated,
+        lineTruncatedCount,
+        ignoredDirs,
+        scopeWarning: buildIgnoredScopeNote(ignoredDirs),
+        nextHint: truncated
+          ? '结果已截断；请缩小 searchedPath、收窄 regex/filePattern，或提高 maxResults 后重试。'
+          : '如果怀疑目标位于 ignoredDirs 中，请显式把 path 指向对应目录后重试。',
+      },
+      'matches',
+      lines.join('\n')
+    );
   } catch (error) {
     const execError = error as Error & { code?: unknown; stdout?: string };
 
     // ripgrep 退出码 1 表示没有匹配结果。
     if (execError.code === 1) {
-      return {
-        content: [{
-          type: 'text',
-          text: `[搜索引擎: ripgrep]\n搜索正则: ${pattern}\n搜索目录: ${base}\n未找到匹配结果。`,
-        }],
-      };
+      return structuredTextResult('搜索完成，未找到匹配结果', {
+        ok: true,
+        type: 'search_content',
+        engine: 'ripgrep',
+        regex: pattern,
+        searchedPath: base,
+        filePattern: filePattern || null,
+        matchesCollected: 0,
+        matchesShown: 0,
+        maxResults: limit,
+        truncated: false,
+        lineTruncatedCount: 0,
+        ignoredDirs,
+        scopeWarning: buildIgnoredScopeNote(ignoredDirs),
+        nextHint: '未找到匹配不等于全仓库不存在；如目标可能位于 ignoredDirs 中，请显式把 path 指向对应目录后重试。',
+      });
     }
 
     // Windows / macOS / Linux 下命令不存在都交给 Node fallback。
@@ -118,16 +239,27 @@ async function nodeFallbackSearch(
   pattern: string,
   base: string,
   filePattern: string | undefined,
-  limit: number
+  limit: number,
+  ignoredDirs: string[]
 ): Promise<CallToolResult> {
   let searchRegex: RegExp;
   try {
     searchRegex = new RegExp(pattern, 'g');
   } catch (e) {
-    return {
-      content: [{ type: 'text', text: `无效的正则表达式: ${pattern}\n错误: ${(e as Error).message}` }],
-      isError: true,
-    };
+    return structuredTextResult(
+      '搜索失败: 无效的正则表达式',
+      {
+        ok: false,
+        type: 'search_content',
+        engine: 'node',
+        regex: pattern,
+        searchedPath: base,
+        error: (e as Error).message,
+      },
+      undefined,
+      undefined,
+      true
+    );
   }
 
   const fileGlob = filePattern || '**/*';
@@ -135,23 +267,26 @@ async function nodeFallbackSearch(
     cwd: base,
     absolute: true,
     nodir: true,
-    ignore: config.traversalIgnoredDirs
-      .map((d) => `**/${d}/**`)
-      .concat(config.excludedFilePatterns)
-      .concat(config.excludedFilePatterns.map((p) => `**/${p}`))
-      .concat(['**/*.lock']),
+    ignore: globIgnorePatterns(ignoredDirs, true),
   });
 
   const results: string[] = [];
   let matchCount = 0;
+  let visitedFiles = 0;
+  let skippedFiles = 0;
+  let lineTruncatedCount = 0;
 
   for (const file of files) {
     if (matchCount >= limit) break;
     try {
       assertPathAllowed(file);
       const stats = await fs.stat(file);
-      if (!stats.isFile() || isFileExcluded(path.basename(file)) || stats.size > Math.min(config.maxReadBytes, 1024 * 1024)) continue;
+      if (!stats.isFile() || isFileExcluded(path.basename(file)) || stats.size > Math.min(config.maxReadBytes, 1024 * 1024)) {
+        skippedFiles++;
+        continue;
+      }
 
+      visitedFiles++;
       const content = await fs.readFile(file, 'utf-8');
       const fileLines = content.split('\n');
 
@@ -159,30 +294,45 @@ async function nodeFallbackSearch(
         if (matchCount >= limit) break;
         searchRegex.lastIndex = 0;
         if (searchRegex.test(fileLines[i])) {
-          const relativePath = path.relative(base, file);
-          results.push(`${relativePath}:${i + 1}: ${fileLines[i].trim()}`);
+          const formatted = formatSearchMatch(file, i + 1, fileLines[i], base);
+          results.push(formatted.line);
+          if (formatted.lineTruncated) lineTruncatedCount++;
           matchCount++;
         }
       }
     } catch {
+      skippedFiles++;
       // 跳过无法读取或越权的文件
     }
   }
 
-  const output = [
-    '[搜索引擎: Node.js 内置]',
-    '提示: 安装 ripgrep 可提升大仓库搜索性能。',
-    `搜索正则: ${pattern}`,
-    `搜索目录: ${base}`,
-    `文件过滤: ${filePattern || '(所有文件)'}`,
-    `找到 ${matchCount} 处匹配:`,
-    '',
-    ...results,
-  ];
+  const truncated = matchCount >= limit && files.length > visitedFiles + skippedFiles;
 
-  return {
-    content: [{ type: 'text', text: output.join('\n') }],
-  };
+  return structuredTextResult(
+    truncated ? '搜索完成，结果可能已截断' : '搜索完成',
+    {
+      ok: true,
+      type: 'search_content',
+      engine: 'node',
+      regex: pattern,
+      searchedPath: base,
+      filePattern: filePattern || null,
+      candidateFiles: files.length,
+      visitedFiles,
+      skippedFiles,
+      matchesShown: results.length,
+      maxResults: limit,
+      truncated,
+      lineTruncatedCount,
+      ignoredDirs,
+      scopeWarning: buildIgnoredScopeNote(ignoredDirs),
+      nextHint: truncated
+        ? '结果可能已截断；请缩小 searchedPath、收窄 regex/filePattern，或提高 maxResults 后重试。'
+        : '如果怀疑目标位于 ignoredDirs 中，请显式把 path 指向对应目录后重试。',
+    },
+    'matches',
+    results.join('\n')
+  );
 }
 
 /**
@@ -194,7 +344,7 @@ export function registerSearchTools(server: McpServer): void {
     'search_files',
     {
       title: 'Search Files',
-      description: '按文件名模式搜索文件，支持 glob 通配符 (如 *.ts, **/*.js)。',
+      description: '按文件名模式搜索文件，支持 glob 通配符 (如 *.ts, **/*.js)。默认忽略高噪声目录，并在返回中说明忽略范围。',
       annotations: readOnlyLocalTool,
       inputSchema: {
         pattern: z.string().min(1).max(300).describe('文件名搜索模式 (glob 通配符)，例如: *.ts, **/*.tsx, src/**/*.go'),
@@ -208,37 +358,60 @@ export function registerSearchTools(server: McpServer): void {
 
       logger.info(`search_files: pattern="${pattern}" base="${base}"`);
 
+      const ignoredDirs = getTraversalIgnoredDirsForBase(base);
       const files = await glob(pattern, {
         cwd: base,
         absolute: true,
         nodir: true,
-        ignore: config.traversalIgnoredDirs
-          .map((d) => `**/${d}/**`)
-          .concat(config.excludedFilePatterns)
-          .concat(config.excludedFilePatterns.map((p) => `**/${p}`)),
+        ignore: globIgnorePatterns(ignoredDirs),
       });
 
       const limit = normalizeLimit(maxResults, 100, 500);
-      const results = files.slice(0, limit).filter((file) => {
+      const results: string[] = [];
+      let skippedFiles = 0;
+      let lineTruncatedCount = 0;
+
+      for (const file of files) {
+        if (results.length >= limit) break;
         try {
           assertPathAllowed(file);
-          return !isFileExcluded(path.basename(file));
+          if (isFileExcluded(path.basename(file))) {
+            skippedFiles++;
+            continue;
+          }
+
+          const preview = previewSearchLine(path.relative(base, file) || path.basename(file));
+          results.push(`${preview.text}${preview.truncated ? ` [lineTruncated=true originalChars=${preview.originalChars}]` : ''}`);
+          if (preview.truncated) lineTruncatedCount++;
         } catch {
-          return false;
+          skippedFiles++;
         }
-      });
+      }
 
-      const output = [
-        `搜索模式: ${pattern}`,
-        `搜索目录: ${base}`,
-        `找到 ${files.length} 个匹配文件${files.length > limit ? ` (显示前 ${limit} 个)` : ''}:`,
-        '',
-        ...results,
-      ];
+      const truncated = files.length > results.length + skippedFiles;
 
-      return {
-        content: [{ type: 'text', text: output.join('\n') }],
-      };
+      return structuredTextResult(
+        truncated ? '文件搜索完成，结果已截断' : '文件搜索完成',
+        {
+          ok: true,
+          type: 'search_files',
+          pattern,
+          searchedPath: base,
+          candidateFiles: files.length,
+          filesShown: results.length,
+          skippedFiles,
+          maxResults: limit,
+          truncated,
+          lineTruncatedCount,
+          ignoredDirs,
+          scopeWarning: buildIgnoredScopeNote(ignoredDirs),
+          nextHint: truncated
+            ? '结果已截断；请缩小 basePath、收窄 pattern，或提高 maxResults 后重试。'
+            : '如果怀疑目标位于 ignoredDirs 中，请显式把 basePath 指向对应目录后重试。',
+        },
+        'files',
+        results.join('\n')
+      );
     }
   );
 
@@ -247,7 +420,7 @@ export function registerSearchTools(server: McpServer): void {
     'search_content',
     {
       title: 'Search Content',
-      description: '在文件内容中搜索正则表达式匹配。优先使用 ripgrep，若未安装则降级为 Node.js 内置搜索。返回匹配的文件和行号。',
+      description: '在文件内容中搜索正则表达式匹配。优先使用 ripgrep，若未安装则降级为 Node.js 内置搜索。返回匹配范围、截断状态和默认忽略目录。',
       annotations: readOnlyLocalTool,
       inputSchema: {
         regex: z.string().min(1).max(500).describe('搜索的正则表达式'),
@@ -259,10 +432,13 @@ export function registerSearchTools(server: McpServer): void {
     async ({ regex: pattern, path: searchPath, filePattern, maxResults }): Promise<CallToolResult> => {
       const validationError = validateSearchPattern(pattern);
       if (validationError) {
-        return {
-          content: [{ type: 'text', text: validationError }],
-          isError: true,
-        };
+        return structuredTextResult(
+          '搜索失败: 参数无效',
+          { ok: false, type: 'search_content', regex: pattern, error: validationError },
+          undefined,
+          undefined,
+          true
+        );
       }
 
       const base = resolvePath(searchPath || '.');
@@ -271,14 +447,15 @@ export function registerSearchTools(server: McpServer): void {
       logger.info(`search_content: regex="${pattern}" base="${base}" filePattern="${filePattern}"`);
 
       const limit = normalizeLimit(maxResults, 50, 500);
+      const ignoredDirs = getTraversalIgnoredDirsForBase(base);
 
-      const rgResult = await tryRipgrep(pattern, base, filePattern, limit);
+      const rgResult = await tryRipgrep(pattern, base, filePattern, limit, ignoredDirs);
       if (rgResult !== null) {
         return rgResult;
       }
 
       logger.info('ripgrep 不可用，降级为 Node.js 内置搜索');
-      return await nodeFallbackSearch(pattern, base, filePattern, limit);
+      return await nodeFallbackSearch(pattern, base, filePattern, limit, ignoredDirs);
     }
   );
 
@@ -312,26 +489,22 @@ export function registerSearchTools(server: McpServer): void {
       };
       const tree = await buildTree(resolved, depthLimit, 0, showHidden ?? false, state);
 
-      return {
-        content: [{
-          type: 'text',
-          text: [
-            'summary: 文件树构建完成',
-            'ok: true',
-            'type: file_tree',
-            `path: ${resolved}`,
-            `maxDepth: ${depthLimit}`,
-            `showHidden: ${showHidden ?? false}`,
-            `entriesShown: ${state.entriesShown}`,
-            `maxEntries: ${entryLimit}`,
-            `truncated: ${state.truncated}`,
-            `omittedEntries: ${state.omittedEntries}`,
-            '',
-            '[tree]',
-            tree || '(空目录)',
-          ].join('\n'),
-        }],
-      };
+      return structuredTextResult(
+        '文件树构建完成',
+        {
+          ok: true,
+          type: 'file_tree',
+          path: resolved,
+          maxDepth: depthLimit,
+          showHidden: showHidden ?? false,
+          entriesShown: state.entriesShown,
+          maxEntries: entryLimit,
+          truncated: state.truncated,
+          omittedEntries: state.omittedEntries,
+        },
+        'tree',
+        tree || '(空目录)'
+      );
     }
   );
 }
