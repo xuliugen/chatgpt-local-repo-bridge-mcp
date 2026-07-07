@@ -13,6 +13,7 @@ import {
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { destructiveLocalTool, readOnlyLocalTool, writeLocalTool } from '../utils/tool-annotations.js';
+import { structuredResult } from '../utils/tool-result.js';
 
 const DEFAULT_READ_LINES = 500;
 const MAX_READ_LINES = 1000;
@@ -54,16 +55,13 @@ function structuredTextResult(
   body?: string,
   isError = false
 ): CallToolResult {
-  const lines = [
-    `summary: ${summary}`,
-    ...Object.entries(fields).map(([key, value]) => `${key}: ${formatFieldValue(value)}`),
-  ];
-
-  if (bodyLabel && body !== undefined) {
-    lines.push('', `[${bodyLabel}]`, body || '(空)');
-  }
-
-  return textResult(lines.join('\n'), isError);
+  return structuredResult({
+    summary,
+    fields,
+    sections: bodyLabel && body !== undefined ? [{ label: bodyLabel, text: body }] : [],
+    isError,
+    meta: { tool: fields.type ?? 'filesystem' },
+  });
 }
 
 async function assertReadableTextFile(resolved: string): Promise<void> {
@@ -579,7 +577,7 @@ async function listDir(
     }
 
     const entry = sorted[i];
-    const prefix = entry.isDirectory() ? '📁 ' : '📄 ';
+    const prefix = entry.isDirectory() ? '[D] ' : '[F] ';
     state.lines.push(`${indent}${prefix}${entry.name}`);
 
     if (recursive && entry.isDirectory() && depth < maxDepth) {

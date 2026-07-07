@@ -21,13 +21,15 @@ ChatGPT 网页端 (chatgpt.com)
 +----------------------------------------------+
 |  MCP Server (localhost:3100)                 |
 |                                              |
-|  默认 Tools (20 个)                          |
+|  默认 Tools (22 个，TOOL_MODE=full)          |
+|  ├── workspace   (1)                         |
 |  ├── filesystem  (8)                         |
 |  ├── search      (3)                         |
-|  └── git         (9)                         |
+|  ├── git         (9)                         |
+|  └── changes     (1)                         |
 |                                              |
 |  可选高风险 Tools                            |
-|  └── terminal    (4, ENABLE_TERMINAL=true)   |
+|  └── terminal    (5, ENABLE_TERMINAL=true)   |
 |                                              |
 |  安全层                                      |
 |  ├── 工作区路径白名单                         |
@@ -70,8 +72,9 @@ Copy-Item .env.example .env
 PORT=3100
 WORKSPACES=.,../mindx-agent
 
-EXCLUDED_DIRS=.git
+TOOL_MODE=full
 ACCESS_BLOCKED_DIRS=
+EXCLUDED_DIRS=.git
 TRAVERSAL_IGNORED_DIRS=
 EXCLUDED_FILES=.env,.env.local,.env.development,.env.development.local,.env.production,.env.production.local,.env.test,.env.test.local,.env.staging,.env.staging.local,.envrc,.npmrc,.pypirc,*.pem,*.key,*.crt,*.cer,*.p12,*.pfx,id_rsa,id_rsa.*,id_ed25519,id_ed25519.*
 ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
@@ -87,6 +90,7 @@ EXPOSE_PUBLIC_INFO=false
 ENABLE_TERMINAL=false
 ALLOWED_COMMANDS=npm run build,npm test,git status,npm run archive:mindx,npm run cover:mindx
 ALLOW_ANY_COMMAND=false
+COMMAND_LOG_MODE=summary
 ALLOW_GIT_FORCE_PUSH=false
 
 MAX_READ_BYTES=1048576
@@ -188,7 +192,7 @@ repo:git
 ```text
 repo:read   读取文件、目录、搜索、Git 只读操作
 repo:write  文件写入、编辑、删除、移动、创建目录
-repo:git    git add / commit / push / pull；当前 run_command 也要求该 scope
+repo:git    git add / commit / push / pull；终端工具也要求该 scope
 ```
 
 ### 3. MCP 服务配置
@@ -232,7 +236,13 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 ## 工具列表
 
-默认注册 20 个工具；当 `ENABLE_TERMINAL=true` 时额外注册 4 个高风险终端工具，总计 24 个。
+`TOOL_MODE=full` 默认注册 22 个工具；当 `ENABLE_TERMINAL=true` 时额外注册 5 个高风险终端工具，总计 27 个。`TOOL_MODE=minimal` 或 `TOOL_MODE=codex` 会隐藏完整 Git 工具以减少 ChatGPT UI 噪声。
+
+### 工作区工具 (1 个)
+
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `open_workspace` | 打开并确认工作区，返回 `workspaceId`、根路径和 UI 聚合提示 | `path` | 只读 |
 
 ### 文件系统工具 (8 个)
 
@@ -255,7 +265,13 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 | `search_content` | 正则内容搜索，优先 ripgrep，失败时 fallback 到 Node.js 搜索 | `regex`, `path?`, `filePattern?`, `maxResults?` | 只读，跳过大文件、排除目录和敏感文件 |
 | `get_file_tree` | 输出目录树 | `path`, `maxDepth?`, `showHidden?` | 只读，隐藏排除目录和敏感文件 |
 
-### Git 工具 (9 个)
+### 变更聚合工具 (1 个)
+
+| Tool | 功能 | 关键参数 | 安全属性 |
+|------|------|----------|----------|
+| `show_changes` | 聚合展示当前工作区 Git diff 摘要和截断预览，用于一轮修改后的统一 review | `repoPath`, `staged?`, `maxPatchChars?` | 只读 |
+
+### Git 工具 (9 个，`TOOL_MODE=full`)
 
 | Tool | 功能 | 关键参数 | 安全属性 |
 |------|------|----------|----------|
@@ -273,10 +289,11 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 
 | Tool | 功能 | 关键参数 | 安全属性 |
 |------|------|----------|----------|
-| `run_command` | 执行 shell 命令，命令结束后一次性返回输出 | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
 | `run_command_start` | 启动后台 shell 命令并立即返回 `jobId` | `command`, `cwd`, `timeout?`, `env?` | 高风险，open world + destructive |
 | `run_command_read` | 按 `offset` 增量读取后台命令输出 | `jobId`, `offset?`, `maxBytes?` | 读取后台 job 输出 |
 | `run_command_cancel` | 取消仍在运行的后台命令 | `jobId` | 高风险，open world + destructive |
+| `exec_command` | DevSpace 风格命令：短暂等待，未完成返回 `jobId` | `command`, `cwd`, `timeout?`, `yieldMs?`, `env?` | 高风险，open world + destructive |
+| `write_stdin` | 向后台命令写入输入或轮询增量输出 | `jobId`, `stdin?`, `offset?`, `maxBytes?` | 高风险，open world + destructive |
 
 启用方式：
 
@@ -284,24 +301,25 @@ curl -i https://consuela-trisyllabical-meetly.ngrok-free.dev/mcp
 ENABLE_TERMINAL=true
 ALLOWED_COMMANDS=npm run build,npm test,git status,npm run archive:mindx,npm run cover:mindx
 ALLOW_ANY_COMMAND=false
+COMMAND_LOG_MODE=summary
 ```
 
 默认只允许 `ALLOWED_COMMANDS` 中配置的完整命令。命令必须完整匹配，不能通过 `&&`、`&`、`;` 追加额外命令。只有设置 `ALLOW_ANY_COMMAND=true` 才允许任意命令。
 
-长命令推荐使用 `run_command_start` / `run_command_read` / `run_command_cancel`：`start` 会快速返回 `jobId`，后台命令继续执行；`read` 每次返回当前可用的增量输出和 `nextOffset`，直到 `done=true`；`cancel` 可取消仍在运行的 job。后台 job 当前限制为最多 5 个并发运行、单个 job 最多保留约 5MB 输出、结束后保留约 10 分钟。
+长命令推荐使用 `exec_command` 或 `run_command_start` / `run_command_read` / `run_command_cancel`：`exec_command` 默认只等待约 200ms 的短 yield 窗口，窗口内完成则直接返回输出，未完成则尽快返回 `jobId`，避免 ChatGPT UI 长时间停在工具调用中；需要一次性等待更久时可显式传 `yieldMs`。`write_stdin` 可作为轮询工具，也可向仍在运行的命令写入输入。后台 job 当前限制为最多 5 个并发运行、单个 job 最多保留约 5MB 输出、结束后保留约 10 分钟。`COMMAND_LOG_MODE=summary` 默认只把命令摘要和最终状态写入 `.mcp-command-logs`；如需审计完整 stdout/stderr，可改为 `COMMAND_LOG_MODE=full`，但高输出命令会带来额外同步 I/O 成本。终端工具默认注入 `NO_COLOR=1`、`TERM=dumb`、`PAGER=cat`、`GIT_PAGER=cat`、`GH_PAGER=cat`、`CI=1` 以减少 ChatGPT UI 噪声。
 
 > 不建议在公网 ngrok 环境中设置 `ALLOW_ANY_COMMAND=true`。
 
 ## 自定义脚本运行模式
 
-`run_command` 的推荐用法不是开放任意命令，而是在本项目中维护一组固定脚本，并通过 `npm run <script>` 暴露为可审计、可白名单控制的能力。
+终端工具的推荐用法不是开放任意命令，而是在本项目中维护一组固定脚本，并通过 `npm run <script>` 暴露为可审计、可白名单控制的能力。
 
 ### 设计原则
 
 1. 具体业务逻辑写在 `scripts/` 目录下，推荐使用 Node.js 脚本以兼容 Windows、macOS 和 Linux。
 2. `package.json` 只暴露稳定的 npm script 名称，例如 `npm run archive:mindx`。
 3. `.env` 的 `ALLOWED_COMMANDS` 只配置完整 npm 命令，不直接配置复杂 shell 命令。
-4. 每次调用会变化的参数通过 `run_command` 的 `env` 字段传入，不拼接到 `command` 字符串里。
+4. 每次调用会变化的参数通过终端工具的 `env` 字段传入，不拼接到 `command` 字符串里。
 5. 脚本内部应固定或校验所有高风险路径、下载 URL、文件大小、解压路径、覆盖策略等边界。
 6. 公网环境不要设置 `ALLOW_ANY_COMMAND=true`。
 
@@ -419,7 +437,8 @@ cwd: <项目根目录>
 
 目录控制拆分为两类：
 
-- `EXCLUDED_DIRS` / `ACCESS_BLOCKED_DIRS`：强制禁止直接访问的目录名，匹配任意层级；默认包含 `.git`。
+- `ACCESS_BLOCKED_DIRS`：强制禁止直接访问的目录名，匹配任意层级；默认包含 `.git`。
+- `EXCLUDED_DIRS`：历史兼容配置，作为遍历/搜索忽略目录处理，不阻止显式路径访问。
 - `TRAVERSAL_IGNORED_DIRS`：目录树、文件搜索、内容搜索默认忽略的高噪声目录；不阻止显式路径访问。
 
 默认遍历忽略目录包括：
@@ -534,13 +553,16 @@ src/
 ├── routes/
 │   └── artifacts.ts            # 通用脚本产物下载路由
 ├── tools/
+│   ├── workspace.ts            # 工作区打开与 UI 聚合信息 (1)
 │   ├── filesystem.ts           # 文件系统工具 (8)
 │   ├── search.ts               # 搜索工具 (3)，支持 ripgrep + Node fallback
 │   ├── git.ts                  # Git 工具 (9)
-│   └── terminal.ts             # 终端工具 (1，默认不注册)
+│   ├── changes.ts              # 聚合变更展示工具 (1)
+│   └── terminal.ts             # 终端工具 (5，默认不注册)
 └── utils/
     ├── logger.ts               # 日志工具
     ├── path-guard.ts           # 路径安全校验、realpath、目录和文件排除
+    ├── tool-result.ts          # structuredContent / _meta.card / 文本预览
     └── tool-annotations.ts     # MCP tool annotations 统一定义
 ```
 
@@ -563,9 +585,9 @@ src/
 | 创建连接器时报 `Something went wrong` | URL 不是 `/mcp`、ngrok 未运行、tool schema/annotations 不合法 | 确认 URL 为 `https://<ngrok>/mcp`，重启服务，查看本地日志和 ngrok 请求日志 |
 | `/health` 能访问，但 ChatGPT 连接失败 | MCP 初始化失败，或 OAuth metadata / Auth0 配置不正确 | 查看本地日志确认 MCP 初始化是否成功，检查 `/.well-known/oauth-protected-resource` 和 Auth0 issuer discovery |
 | 服务启动失败 | `WORKSPACES` 配置了不存在或非目录路径 | 修正 `WORKSPACES` 后重启 |
-| 工具数量从 21 变成 20 | `ENABLE_TERMINAL=false` | 这是默认安全行为；需要终端工具时显式开启 |
-| `run_command` 不存在 | 终端工具默认未注册 | 设置 `ENABLE_TERMINAL=true` 并重启服务 |
-| `run_command` 被拒绝 | 命令不在 `ALLOWED_COMMANDS` 完整命令列表中 | 添加完整允许命令，或仅在可信环境设置 `ALLOW_ANY_COMMAND=true` |
+| 工具数量不是 27 | `ENABLE_TERMINAL=false` 或 `TOOL_MODE=minimal/codex` | full+terminal 为 27；minimal/codex 会隐藏完整 Git 工具；终端工具需要显式开启 |
+| `exec_command` 不存在 | 终端工具默认未注册 | 设置 `ENABLE_TERMINAL=true` 并重启服务 |
+| 终端命令被拒绝 | 命令不在 `ALLOWED_COMMANDS` 完整命令列表中 | 添加完整允许命令，或仅在可信环境设置 `ALLOW_ANY_COMMAND=true` |
 | 读取 `.env` 被拒绝 | 命中 `EXCLUDED_FILES` | 这是默认安全行为；不建议关闭 |
 | 路径不在工作区 | `WORKSPACES` 未包含目标目录，或 symlink 指向外部 | 修改 `WORKSPACES` 后重启服务，避免依赖外部 symlink |
 | 读取文件被拒绝 | 文件超过 `MAX_READ_BYTES`、不是普通文件或命中 `EXCLUDED_FILES` | 调整限制或改为读取更小文件 |

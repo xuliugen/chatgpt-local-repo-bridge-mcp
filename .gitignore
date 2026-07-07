@@ -7,3 +7,4 @@ dist/
 .artifacts/
 .incoming/
 .backups/
+.mcp-command-logs/

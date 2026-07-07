@@ -20,6 +20,7 @@ const excludedDirectoryNames = [
   '.nuxt',
   '.cache',
   '.mindx-agent',
+  '.mcp-command-logs',
   '.claude',
   'coverage',
   '.venv',

@@ -28,12 +28,16 @@ export interface AppConfig {
   excludedFilePatterns: string[];
   /** 允许的 CORS 来源 */
   allowedOrigins: string[];
+  /** 工具注册模式：full 注册全部工具；minimal/codex 注册更少工具以降低 ChatGPT UI 噪声 */
+  toolMode: 'full' | 'minimal' | 'codex';
   /** 是否注册任意命令执行工具 */
   enableTerminal: boolean;
   /** 是否允许 run_command 执行任意命令；默认 false，建议只使用 allowedCommands */
   allowAnyCommand: boolean;
   /** run_command 允许执行的完整命令列表 */
   allowedCommands: string[];
+  /** 命令日志模式：summary 只写摘要；full 逐 chunk 写完整输出；off 不写日志 */
+  commandLogMode: 'summary' | 'full' | 'off';
   /** 是否允许 git push --force */
   allowGitForcePush: boolean;
   /** 是否在根路径公开详细工具清单 */
@@ -65,6 +69,22 @@ function parseList(value: string | undefined): string[] {
 function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined || value.trim() === '') return defaultValue;
   return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+function parseToolMode(value: string | undefined): 'full' | 'minimal' | 'codex' {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'minimal' || normalized === 'codex' || normalized === 'full') {
+    return normalized;
+  }
+  return 'full';
+}
+
+function parseCommandLogMode(value: string | undefined): 'summary' | 'full' | 'off' {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'summary' || normalized === 'full' || normalized === 'off') {
+    return normalized;
+  }
+  return 'summary';
 }
 
 function parseNumber(value: string | undefined, defaultValue: number, min: number, max: number): number {
@@ -157,9 +177,11 @@ export function loadConfig(): AppConfig {
     allowedOrigins.push('https://chatgpt.com', 'https://chat.openai.com');
   }
 
+  const toolMode = parseToolMode(process.env.TOOL_MODE);
   const enableTerminal = parseBoolean(process.env.ENABLE_TERMINAL, false);
   const allowAnyCommand = parseBoolean(process.env.ALLOW_ANY_COMMAND, false);
   const allowedCommands = parseList(process.env.ALLOWED_COMMANDS);
+  const commandLogMode = parseCommandLogMode(process.env.COMMAND_LOG_MODE);
   const allowGitForcePush = parseBoolean(process.env.ALLOW_GIT_FORCE_PUSH, false);
   const exposePublicInfo = parseBoolean(process.env.EXPOSE_PUBLIC_INFO, false);
 
@@ -183,9 +205,11 @@ export function loadConfig(): AppConfig {
     traversalIgnoredDirs,
     excludedFilePatterns,
     allowedOrigins,
+    toolMode,
     enableTerminal,
     allowAnyCommand,
     allowedCommands,
+    commandLogMode,
     allowGitForcePush,
     exposePublicInfo,
     maxReadBytes,

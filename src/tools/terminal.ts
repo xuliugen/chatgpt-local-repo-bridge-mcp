@@ -1,18 +1,17 @@
 import { z } from 'zod';
-import { exec, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { assertPathAllowed, resolvePath } from '../utils/path-guard.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 import { openWorldDestructiveTool } from '../utils/tool-annotations.js';
+import { structuredResult } from '../utils/tool-result.js';
 
-const execAsync = promisify(exec);
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_ACTIVE_JOBS = 5;
 const MAX_JOB_OUTPUT_CHARS = 5 * 1024 * 1024;
@@ -21,6 +20,8 @@ const MAX_READ_CHARS = 64 * 1024;
 const FINISHED_JOB_TTL_MS = 10 * 60_000;
 const COMMAND_PREVIEW_CHARS = 16 * 1024;
 const COMMAND_LOG_DIR_NAME = '.mcp-command-logs';
+const DEFAULT_EXEC_YIELD_MS = 200;
+const MAX_EXEC_YIELD_MS = 30_000;
 
 type TerminalJobStatus = 'running' | 'exited' | 'failed' | 'timeout' | 'cancelled';
 
@@ -35,11 +36,14 @@ interface TerminalJob {
   output: string;
   baseOffset: number;
   truncatedChars: number;
+  totalOutputChars: number;
   timeoutHandle?: NodeJS.Timeout;
   cleanupHandle?: NodeJS.Timeout;
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   errorMessage?: string;
+  logFilePath: string | null;
+  logWriteError?: string;
 }
 
 const terminalJobs = new Map<string, TerminalJob>();
@@ -57,6 +61,18 @@ function isCommandAllowed(command: string): boolean {
 
   const normalizedCommand = normalizeCommand(command);
   return config.allowedCommands.some((allowed) => normalizeCommand(allowed) === normalizedCommand);
+}
+
+function defaultCommandEnv(): Record<string, string> {
+  return {
+    NO_COLOR: '1',
+    TERM: 'dumb',
+    PAGER: 'cat',
+    GIT_PAGER: 'cat',
+    GH_PAGER: 'cat',
+    CI: '1',
+    CODEX_CI: '1',
+  };
 }
 
 function sanitizeEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
@@ -81,6 +97,21 @@ function textResult(text: string, isError = false): CallToolResult {
     content: [{ type: 'text', text }],
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function terminalResult(
+  summary: string,
+  fields: Record<string, unknown>,
+  sections: Array<{ label: string; text: string }> = [],
+  isError = false
+): CallToolResult {
+  return structuredResult({
+    summary,
+    fields,
+    sections,
+    isError,
+    meta: { tool: fields.type ?? 'terminal' },
+  });
 }
 
 function stripAnsi(text: string): string {
@@ -141,103 +172,50 @@ function previewText(text: string | undefined, maxChars = COMMAND_PREVIEW_CHARS)
   };
 }
 
-async function writeCommandLogFile(args: {
-  cwd: string;
-  command: string;
-  startedAt: number;
-  endedAt: number;
-  stdout?: string;
-  stderr?: string;
-  error?: string;
-  exitCode?: unknown;
-  killed?: boolean;
-}): Promise<string | null> {
-  const stdout = args.stdout ?? '';
-  const stderr = args.stderr ?? '';
-  const error = args.error ?? '';
-  if (!stdout && !stderr && !error) return null;
 
-  const logDir = path.join(args.cwd, COMMAND_LOG_DIR_NAME);
-  await fs.mkdir(logDir, { recursive: true });
 
-  const logPath = path.join(logDir, `${new Date(args.endedAt).toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.log`);
-  const logContent = [
-    `command: ${redactCommand(args.command)}`,
-    `cwd: ${args.cwd}`,
-    `startedAt: ${new Date(args.startedAt).toISOString()}`,
-    `endedAt: ${new Date(args.endedAt).toISOString()}`,
-    `durationMs: ${args.endedAt - args.startedAt}`,
-    `exitCode: ${String(args.exitCode ?? '')}`,
-    `killed: ${args.killed ?? false}`,
-    '',
-    '[stdout]',
-    stdout || '(空)',
-    '',
-    '[stderr]',
-    stderr || '(空)',
-    '',
-    '[error]',
-    error || '(空)',
-  ].join('\n');
+function createJobLogFile(cwd: string, command: string, startedAt: number): string | null {
+  if (config.commandLogMode === 'off') return null;
 
   try {
-    await fs.writeFile(logPath, logContent, 'utf-8');
+    const logDir = path.join(cwd, COMMAND_LOG_DIR_NAME);
+    fsSync.mkdirSync(logDir, { recursive: true });
+    const logPath = path.join(logDir, `${new Date(startedAt).toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.log`);
+    fsSync.writeFileSync(
+      logPath,
+      [
+        `command: ${redactCommand(command)}`,
+        `cwd: ${cwd}`,
+        `startedAt: ${new Date(startedAt).toISOString()}`,
+        `logMode: ${config.commandLogMode}`,
+        '',
+        config.commandLogMode === 'full'
+          ? '[output]'
+          : '[summary]\nstdout/stderr are kept in memory for tool polling; set COMMAND_LOG_MODE=full to persist full command output.',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
     return logPath;
   } catch (error) {
-    logger.warn(`命令完整日志写入失败: ${(error as Error).message}`);
+    logger.warn(`job log init failed: ${(error as Error).message}`);
     return null;
   }
 }
 
-function formatCommandResult(args: {
-  ok: boolean;
-  command: string;
-  cwd: string;
-  timeoutMs: number;
-  startedAt: number;
-  endedAt: number;
-  stdout?: string;
-  stderr?: string;
-  error?: string;
-  exitCode?: unknown;
-  killed?: boolean;
-  logFilePath: string | null;
-}): string {
-  const stdout = previewText(args.stdout);
-  const stderr = previewText(args.stderr);
-  const error = previewText(args.error, 4096);
-  const fullLogRequired = stdout.truncated || stderr.truncated || error.truncated;
+function appendJobLog(job: TerminalJob, source: 'stdout' | 'stderr' | 'system', text: string): void {
+  if (!job.logFilePath || job.logWriteError) return;
+  if (config.commandLogMode !== 'full' && source !== 'system') return;
 
-  return structuredText(
-    args.ok ? '命令执行成功' : '命令执行失败',
-    {
-      ok: args.ok,
-      type: 'command_result',
-      command: redactCommand(args.command),
-      cwd: args.cwd,
-      timeoutMs: args.timeoutMs,
-      durationMs: args.endedAt - args.startedAt,
-      exitCode: args.exitCode ?? null,
-      killed: args.killed ?? false,
-      stdoutBytes: stdout.bytes,
-      stderrBytes: stderr.bytes,
-      stdoutTruncated: stdout.truncated,
-      stderrTruncated: stderr.truncated,
-      errorTruncated: error.truncated,
-      logFilePath: args.logFilePath,
-      fullLogSeparated: args.logFilePath !== null,
-      fullLogRequired,
-      nextHint: fullLogRequired && args.logFilePath
-        ? '输出预览已截断；请读取 logFilePath 获取完整日志后再下结论。'
-        : '输出预览未截断；如需审计完整 stdout/stderr，可读取 logFilePath。',
-    },
-    [
-      { label: 'stdoutPreview', text: stdout.preview },
-      { label: 'stderrPreview', text: stderr.preview },
-      ...(args.error ? [{ label: 'error', text: error.preview }] : []),
-    ]
-  );
+  try {
+    fsSync.appendFileSync(job.logFilePath, `[${source}]\n${text}${text.endsWith('\n') ? '' : '\n'}`, 'utf8');
+  } catch (error) {
+    job.logWriteError = (error as Error).message;
+    logger.warn(`job log write failed: ${job.logWriteError}`);
+  }
 }
+
+
 
 function formatIsoTime(timeMs: number | undefined): string {
   return timeMs ? new Date(timeMs).toISOString() : '';
@@ -249,6 +227,10 @@ function activeJobCount(): number {
     if (job.status === 'running') count += 1;
   }
   return count;
+}
+
+function fullOutputLogAvailable(job: TerminalJob): boolean {
+  return config.commandLogMode === 'full' && job.logFilePath !== null;
 }
 
 function scheduleJobCleanup(job: TerminalJob): void {
@@ -276,6 +258,8 @@ function appendJobOutput(job: TerminalJob, source: 'stdout' | 'stderr' | 'system
 
   const chunk = `[${source}]\n${text}${text.endsWith('\n') ? '' : '\n'}`;
   job.output += chunk;
+  job.totalOutputChars += chunk.length;
+  appendJobLog(job, source, text);
 
   const overflow = job.output.length - MAX_JOB_OUTPUT_CHARS;
   if (overflow > 0) {
@@ -301,6 +285,7 @@ function finishJob(
   job.exitCode = details.exitCode;
   job.signal = details.signal;
   job.errorMessage = details.errorMessage;
+  appendJobLog(job, 'system', `status=${status} exitCode=${String(details.exitCode ?? '')} signal=${String(details.signal ?? '')} endedAt=${new Date().toISOString()}`);
 
   if (job.timeoutHandle) {
     clearTimeout(job.timeoutHandle);
@@ -321,7 +306,16 @@ function formatJobStart(job: TerminalJob): string {
       startedAt: formatIsoTime(job.startedAt),
       offset: job.baseOffset,
       nextOffset: job.baseOffset,
+      running: job.status === 'running',
       done: false,
+      wallTimeMs: Date.now() - job.startedAt,
+      outputTruncated: job.truncatedChars > 0,
+      logFilePath: job.logFilePath,
+      logMode: config.commandLogMode,
+      fullLogSeparated: fullOutputLogAvailable(job),
+      logFilePathContainsFullOutput: fullOutputLogAvailable(job),
+      logWriteError: job.logWriteError ?? null,
+      nextAction: '使用 run_command_read 或 write_stdin 继续读取；需要取消时使用 run_command_cancel。',
     },
     [{ label: 'nextStep', text: '使用 run_command_read 传入 jobId 和 offset 读取增量输出。' }]
   );
@@ -365,6 +359,15 @@ function formatJobRead(job: TerminalJob, requestedOffset: number | undefined, ma
       signal: job.signal ?? null,
       error: job.errorMessage ?? null,
       truncatedChars: job.truncatedChars,
+      outputTruncated: job.truncatedChars > 0,
+      totalOutputChars: job.totalOutputChars,
+      logFilePath: job.logFilePath,
+      logMode: config.commandLogMode,
+      fullLogSeparated: fullOutputLogAvailable(job),
+      logFilePathContainsFullOutput: fullOutputLogAvailable(job),
+      wallTimeMs: (job.endedAt ?? Date.now()) - job.startedAt,
+      running: job.status === 'running',
+      nextAction: done ? '命令已结束且当前输出已读完。' : '继续使用 run_command_read 或 write_stdin 传入 nextOffset 读取后续输出。',
       warnings,
       ansiStripped: rawOutput !== output,
       maxChars,
@@ -397,7 +400,7 @@ function commandRejectedResult(): CallToolResult {
         allowAnyCommand: config.allowAnyCommand,
         allowedCommandCount: config.allowedCommands.length,
       },
-      [{ label: 'reason', text: 'run_command 当前只允许 ALLOWED_COMMANDS 中配置的完整命令。如确需开放任意命令，请设置 ALLOW_ANY_COMMAND=true，但不建议在公网环境使用。' }]
+      [{ label: 'reason', text: '终端工具当前只允许 ALLOWED_COMMANDS 中配置的完整命令。如确需开放任意命令，请设置 ALLOW_ANY_COMMAND=true，但不建议在公网环境使用。' }]
     ),
     true
   );
@@ -407,106 +410,6 @@ function commandRejectedResult(): CallToolResult {
  * 注册终端相关 Tools
  */
 export function registerTerminalTools(server: McpServer): void {
-  // run_command - 执行 shell 命令并在命令结束后一次性返回输出
-  server.registerTool(
-    'run_command',
-    {
-      title: 'Run Command',
-      description:
-        '在指定目录下执行 shell 命令。此工具高风险，默认不注册；启用后仍默认只允许 ALLOWED_COMMANDS 中配置的完整命令。',
-      annotations: openWorldDestructiveTool,
-      inputSchema: {
-        command: z.string().min(1).max(500).describe('要执行的 shell 命令；默认必须完整匹配 ALLOWED_COMMANDS 中的一项'),
-        cwd: z.string().describe('命令执行的工作目录'),
-        timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).optional().describe('命令超时时间 (毫秒)，默认 30000，最高 120000'),
-        env: z.record(z.string(), z.string()).optional().describe('额外的环境变量；禁止覆盖 NODE_OPTIONS 和 npm_config_script_shell'),
-      },
-    },
-    async ({ command, cwd, timeout, env }): Promise<CallToolResult> => {
-      const resolvedCwd = resolvePath(cwd);
-      assertPathAllowed(resolvedCwd);
-
-      if (!isCommandAllowed(command)) {
-        return commandRejectedResult();
-      }
-
-      const timeoutMs = Math.min(timeout ?? 30000, MAX_TIMEOUT_MS);
-      const extraEnv = sanitizeEnv(env as Record<string, string> | undefined);
-
-      logger.warn(`run_command: "${redactCommand(command)}" in ${resolvedCwd}`);
-
-      const startedAt = Date.now();
-
-      try {
-        const { stdout, stderr } = await execAsync(command, {
-          cwd: resolvedCwd,
-          timeout: timeoutMs,
-          maxBuffer: 10 * 1024 * 1024,
-          env: { ...process.env, ...extraEnv },
-          windowsHide: true,
-        });
-        const endedAt = Date.now();
-        const logFilePath = await writeCommandLogFile({
-          cwd: resolvedCwd,
-          command,
-          startedAt,
-          endedAt,
-          stdout,
-          stderr,
-          exitCode: 0,
-        });
-
-        return textResult(formatCommandResult({
-          ok: true,
-          command,
-          cwd: resolvedCwd,
-          timeoutMs,
-          startedAt,
-          endedAt,
-          stdout,
-          stderr,
-          exitCode: 0,
-          logFilePath,
-        }));
-      } catch (error) {
-        const endedAt = Date.now();
-        const execError = error as {
-          stdout?: string;
-          stderr?: string;
-          killed?: boolean;
-          message?: string;
-          code?: unknown;
-        };
-        const errorMessage = execError.message || '命令执行失败';
-        const logFilePath = await writeCommandLogFile({
-          cwd: resolvedCwd,
-          command,
-          startedAt,
-          endedAt,
-          stdout: execError.stdout,
-          stderr: execError.stderr,
-          error: errorMessage,
-          exitCode: execError.code,
-          killed: execError.killed,
-        });
-
-        return textResult(formatCommandResult({
-          ok: false,
-          command,
-          cwd: resolvedCwd,
-          timeoutMs,
-          startedAt,
-          endedAt,
-          stdout: execError.stdout,
-          stderr: execError.stderr,
-          error: execError.killed ? `命令在 ${timeoutMs}ms 后被终止\n${errorMessage}` : errorMessage,
-          exitCode: execError.code ?? null,
-          killed: execError.killed,
-          logFilePath,
-        }), true);
-      }
-    }
-  );
 
   // run_command_start - 启动后台命令，返回 jobId，供后续增量读取
   server.registerTool(
@@ -546,20 +449,23 @@ export function registerTerminalTools(server: McpServer): void {
       const child = spawn(command, {
         cwd: resolvedCwd,
         shell: true,
-        env: { ...process.env, ...extraEnv },
+        env: { ...process.env, ...defaultCommandEnv(), ...extraEnv },
         windowsHide: true,
       });
 
+      const jobStartedAt = Date.now();
       const job: TerminalJob = {
         id: jobId,
         command,
         cwd: resolvedCwd,
         status: 'running',
-        startedAt: Date.now(),
+        startedAt: jobStartedAt,
         child,
         output: '',
         baseOffset: 0,
         truncatedChars: 0,
+        totalOutputChars: 0,
+        logFilePath: createJobLogFile(resolvedCwd, command, jobStartedAt),
       };
 
       terminalJobs.set(jobId, job);
@@ -596,6 +502,194 @@ export function registerTerminalTools(server: McpServer): void {
       job.timeoutHandle.unref?.();
 
       return textResult(formatJobStart(job));
+    }
+  );
+
+  // exec_command - DevSpace-style command: short yield, then return jobId if still running.
+  server.registerTool(
+    'exec_command',
+    {
+      title: 'Exec Command',
+      description: 'Run a command with a short yield window. If it is still running, return a jobId for polling.',
+      annotations: openWorldDestructiveTool,
+      inputSchema: {
+        command: z.string().min(1).max(500).describe('Command to execute; must match ALLOWED_COMMANDS unless ALLOW_ANY_COMMAND=true'),
+        cwd: z.string().describe('Working directory'),
+        timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).optional().describe('Total timeout in ms, default 30000, max 120000'),
+        yieldMs: z.number().int().positive().max(MAX_EXEC_YIELD_MS).optional().describe('Initial yield window in ms, default 200, max 30000'),
+        env: z.record(z.string(), z.string()).optional().describe('Extra environment variables; NO_COLOR/TERM/PAGER/CI are injected by default'),
+      },
+    },
+    async ({ command, cwd, timeout, yieldMs, env }): Promise<CallToolResult> => {
+      cleanupExpiredJobs();
+      const resolvedCwd = resolvePath(cwd);
+      assertPathAllowed(resolvedCwd);
+
+      if (!isCommandAllowed(command)) return commandRejectedResult();
+      if (activeJobCount() >= MAX_ACTIVE_JOBS) {
+        return terminalResult('Active command job limit reached', {
+          ok: false,
+          type: 'exec_command',
+          activeJobs: activeJobCount(),
+          maxActiveJobs: MAX_ACTIVE_JOBS,
+        }, [], true);
+      }
+
+      const timeoutMs = Math.min(timeout ?? 30000, MAX_TIMEOUT_MS);
+      const firstYieldMs = Math.min(yieldMs ?? DEFAULT_EXEC_YIELD_MS, MAX_EXEC_YIELD_MS, timeoutMs);
+      const extraEnv = sanitizeEnv(env as Record<string, string> | undefined);
+      const jobId = `cmd_${randomUUID()}`;
+      logger.warn(`exec_command: job=${jobId} command="${redactCommand(command)}" in ${resolvedCwd}`);
+
+      const child = spawn(command, {
+        cwd: resolvedCwd,
+        shell: true,
+        env: { ...process.env, ...defaultCommandEnv(), ...extraEnv },
+        windowsHide: true,
+      });
+
+      const jobStartedAt = Date.now();
+      const job: TerminalJob = {
+        id: jobId,
+        command,
+        cwd: resolvedCwd,
+        status: 'running',
+        startedAt: jobStartedAt,
+        child,
+        output: '',
+        baseOffset: 0,
+        truncatedChars: 0,
+        totalOutputChars: 0,
+        logFilePath: createJobLogFile(resolvedCwd, command, jobStartedAt),
+      };
+      terminalJobs.set(jobId, job);
+
+      child.stdout.on('data', (chunk: Buffer) => appendJobOutput(job, 'stdout', chunk));
+      child.stderr.on('data', (chunk: Buffer) => appendJobOutput(job, 'stderr', chunk));
+      child.once('error', (error) => {
+        appendJobOutput(job, 'system', `Command failed to start or run: ${error.message}\n`);
+        finishJob(job, 'failed', { errorMessage: error.message });
+      });
+      child.once('close', (code, signal) => {
+        if (job.status !== 'running') {
+          if (job.exitCode === undefined) job.exitCode = code;
+          if (job.signal === undefined) job.signal = signal;
+          return;
+        }
+        finishJob(job, code === 0 ? 'exited' : 'failed', { exitCode: code, signal });
+      });
+      job.timeoutHandle = setTimeout(() => {
+        if (job.status !== 'running') return;
+        appendJobOutput(job, 'system', `Command timed out after ${timeoutMs}ms; terminating.\n`);
+        finishJob(job, 'timeout', { errorMessage: `Command timed out after ${timeoutMs}ms` });
+        child.kill();
+      }, timeoutMs);
+      job.timeoutHandle.unref?.();
+
+      await new Promise<void>((resolve) => {
+        if (job.status !== 'running') {
+          resolve();
+          return;
+        }
+
+        let resolved = false;
+        let yieldHandle: NodeJS.Timeout;
+        const finishWait = (): void => {
+          if (resolved) return;
+          resolved = true;
+          clearTimeout(yieldHandle);
+          child.off('close', finishWait);
+          child.off('error', finishWait);
+          resolve();
+        };
+
+        yieldHandle = setTimeout(finishWait, firstYieldMs);
+        child.once('close', finishWait);
+        child.once('error', finishWait);
+      });
+      const snapshot = formatJobRead(job, job.baseOffset, DEFAULT_READ_CHARS);
+      const running = job.status === 'running';
+
+      return terminalResult(running ? 'Command still running; jobId returned' : 'Command completed within yield window', {
+        ok: running || job.status === 'exited',
+        type: 'exec_command',
+        jobId: job.id,
+        running,
+        status: job.status,
+        exitCode: job.exitCode ?? null,
+        signal: job.signal ?? null,
+        wallTimeMs: (job.endedAt ?? Date.now()) - job.startedAt,
+        outputTruncated: job.truncatedChars > 0,
+        logFilePath: job.logFilePath,
+        logMode: config.commandLogMode,
+        fullLogSeparated: fullOutputLogAvailable(job),
+        logFilePathContainsFullOutput: fullOutputLogAvailable(job),
+        logWriteError: job.logWriteError ?? null,
+        nextAction: running
+          ? 'Use write_stdin with jobId to poll output; use run_command_cancel to cancel.'
+          : 'Command finished. Output remains readable during retention via write_stdin or run_command_read.',
+      }, [{
+        label: 'snapshot', text: snapshot }], !running && job.status !== 'exited');
+    }
+  );
+
+  // write_stdin - DevSpace-style poll/input tool.
+  server.registerTool(
+    'write_stdin',
+    {
+      title: 'Write Stdin / Poll Command',
+      description: 'Write optional input to a background command and read incremental output. Without stdin, this is a polling tool.',
+      annotations: openWorldDestructiveTool,
+      inputSchema: {
+        jobId: z.string().min(1).describe('jobId returned by exec_command or run_command_start'),
+        stdin: z.string().optional().describe('Text to write to process input;; omit to only read output'),
+        offset: z.number().int().nonnegative().optional().describe('Output offset to read from'),
+        maxBytes: z.number().int().positive().max(MAX_READ_CHARS).optional().describe('Max chars to read, default 16384, max 65536'),
+      },
+    },
+    async ({ jobId, stdin, offset, maxBytes }): Promise<CallToolResult> => {
+      cleanupExpiredJobs();
+
+      const job = terminalJobs.get(jobId);
+      if (!job) {
+        return terminalResult('Command job not found', {
+          ok: false,
+          type: 'write_stdin',
+          jobId,
+          retentionMs: FINISHED_JOB_TTL_MS,
+        }, [], true);
+      }
+
+      let stdinWritten = false;
+      if (stdin !== undefined) {
+        if (job.status !== 'running') {
+          return terminalResult('Input failed: command already finished', {
+            ok: false,
+            type: 'write_stdin',
+            jobId,
+            status: job.status,
+            running: false,
+          }, [], true);
+        }
+        job.child.stdin.write(stdin);
+        stdinWritten = true;
+      }
+
+      const readLimit = Math.min(maxBytes ?? DEFAULT_READ_CHARS, MAX_READ_CHARS);
+      return terminalResult('Command output read complete', {
+        ok: true,
+        type: 'write_stdin',
+        jobId,
+        stdinWritten,
+        status: job.status,
+        running: job.status === 'running',
+        readLimit,
+        logFilePath: job.logFilePath,
+        logMode: config.commandLogMode,
+        fullLogSeparated: fullOutputLogAvailable(job),
+        logFilePathContainsFullOutput: fullOutputLogAvailable(job),
+        logWriteError: job.logWriteError ?? null,
+      }, [{ label: 'snapshot', text: formatJobRead(job, offset, readLimit) }]);
     }
   );
 

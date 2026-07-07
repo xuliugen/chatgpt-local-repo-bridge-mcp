@@ -3,8 +3,46 @@ import { registerFilesystemTools } from './tools/filesystem.js';
 import { registerSearchTools } from './tools/search.js';
 import { registerGitTools } from './tools/git.js';
 import { registerTerminalTools } from './tools/terminal.js';
+import { registerChangeTools } from './tools/changes.js';
+import { registerWorkspaceTools } from './tools/workspace.js';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+
+function registerDefaultToolSet(server: McpServer): number {
+  registerWorkspaceTools(server);
+  logger.info('  - 工作区工具 (1 个 Tool)');
+
+  registerFilesystemTools(server);
+  logger.info('  - 文件系统工具 (8 个 Tools)');
+
+  registerSearchTools(server);
+  logger.info('  - 搜索工具 (3 个 Tools)');
+
+  registerGitTools(server);
+  logger.info('  - Git 工具 (9 个 Tools)');
+
+  registerChangeTools(server);
+  logger.info('  - 变更聚合工具 (1 个 Tool)');
+
+  return 22;
+}
+
+function registerCompactToolSet(server: McpServer): number {
+  registerWorkspaceTools(server);
+  logger.info('  - 工作区工具 (1 个 Tool)');
+
+  registerFilesystemTools(server);
+  logger.info('  - 文件系统工具 (8 个 Tools)');
+
+  registerSearchTools(server);
+  logger.info('  - 搜索工具 (3 个 Tools)');
+
+  registerChangeTools(server);
+  logger.info('  - 变更聚合工具 (1 个 Tool)');
+
+  logger.info('  - Git 工具已在 compact 模式隐藏；需要完整 Git 工具请设置 TOOL_MODE=full');
+  return 13;
+}
 
 /**
  * 创建并配置 MCP Server
@@ -23,25 +61,22 @@ export function createMcpServer(): McpServer {
     }
   );
 
-  logger.info('正在注册 MCP Tools...');
+  logger.info(`正在注册 MCP Tools... toolMode=${config.toolMode}`);
 
-  registerFilesystemTools(server);
-  logger.info('  - 文件系统工具 (8 个 Tools)');
+  const baseToolCount = config.toolMode === 'full'
+    ? registerDefaultToolSet(server)
+    : registerCompactToolSet(server);
 
-  registerSearchTools(server);
-  logger.info('  - 搜索工具 (3 个 Tools)');
-
-  registerGitTools(server);
-  logger.info('  - Git 工具 (9 个 Tools)');
-
+  let terminalToolCount = 0;
   if (config.enableTerminal) {
     registerTerminalTools(server);
-    logger.warn('  - 终端工具 (4 个 Tools，已启用高风险命令执行能力)');
+    terminalToolCount = 5;
+    logger.warn('  - 终端工具 (5 个 Tools，已启用高风险命令执行能力)');
   } else {
     logger.info('  - 终端工具已禁用 (ENABLE_TERMINAL=false)');
   }
 
-  logger.info(`共注册 ${config.enableTerminal ? 24 : 20} 个 MCP Tools`);
+  logger.info(`共注册 ${baseToolCount + terminalToolCount} 个 MCP Tools`);
 
   return server;
 }
