@@ -123,7 +123,6 @@ export function loadConfig(): AppConfig {
   const defaultAccessBlockedDirs = ['.git'];
   const excludedDirs = Array.from(new Set([
     ...defaultAccessBlockedDirs,
-    ...configuredExcludedDirs,
     ...configuredAccessBlockedDirs,
   ]));
 

@@ -278,18 +278,13 @@ export function registerFilesystemTools(server: McpServer): void {
       inputSchema: {
         path: z.string().describe('要编辑的文件路径'),
         edits: z.array(
-          z.union([
-            z.object({
-              oldText: z.string().min(1).describe('要被替换的原始文本；必须唯一匹配'),
-              newText: z.string().describe('替换后的新文本'),
-            }),
-            z.object({
-              startLine: z.number().int().positive().describe('替换起始行号 (1-based)'),
-              endLine: z.number().int().positive().describe('替换结束行号 (1-based，包含该行)'),
-              newText: z.string().describe('替换后的新文本'),
-            }),
-          ])
-        ).min(1).max(50).describe('替换操作列表'),
+          z.object({
+            oldText: z.string().min(1).optional().describe('文本匹配模式：要被替换的原始文本；必须唯一匹配'),
+            startLine: z.number().int().positive().optional().describe('行号模式：替换起始行号 (1-based)'),
+            endLine: z.number().int().positive().optional().describe('行号模式：替换结束行号 (1-based，包含该行)'),
+            newText: z.string().describe('替换后的新文本'),
+          })
+        ).min(1).max(50).describe('替换操作列表；每个 edit 使用 oldText 或 startLine/endLine 二选一'),
       },
     },
     async ({ path: filePath, edits }): Promise<CallToolResult> => {
@@ -305,7 +300,30 @@ export function registerFilesystemTools(server: McpServer): void {
       const appliedEdits: string[] = [];
 
       for (const edit of edits) {
-        if ('startLine' in edit && 'endLine' in edit) {
+        const usesLineRange = edit.startLine !== undefined || edit.endLine !== undefined;
+        const usesTextMatch = edit.oldText !== undefined;
+
+        if (usesLineRange && usesTextMatch) {
+          return structuredTextResult(
+            '编辑失败: 单个 edit 不能同时使用 oldText 和 startLine/endLine',
+            { ok: false, type: 'edit_file', path: resolved },
+            undefined,
+            undefined,
+            true
+          );
+        }
+
+        if (usesLineRange) {
+          if (edit.startLine === undefined || edit.endLine === undefined) {
+            return structuredTextResult(
+              '编辑失败: 行号模式必须同时提供 startLine 和 endLine',
+              { ok: false, type: 'edit_file', path: resolved },
+              undefined,
+              undefined,
+              true
+            );
+          }
+
           const start = edit.startLine - 1;
           const end = edit.endLine;
 
@@ -330,6 +348,16 @@ export function registerFilesystemTools(server: McpServer): void {
           appliedEdits.push(`行 ${edit.startLine}-${edit.endLine}: 替换了 ${end - start} 行`);
           content = lines.join('\n');
         } else {
+          if (!edit.oldText) {
+            return structuredTextResult(
+              '编辑失败: 文本匹配模式必须提供 oldText，或使用 startLine/endLine 行号模式',
+              { ok: false, type: 'edit_file', path: resolved },
+              undefined,
+              undefined,
+              true
+            );
+          }
+
           const joined = lines.join('\n');
           const count = joined.split(edit.oldText).length - 1;
 
