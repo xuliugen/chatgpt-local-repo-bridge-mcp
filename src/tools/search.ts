@@ -14,6 +14,10 @@ import { structuredResult } from '../utils/tool-result.js';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_TREE_MAX_ENTRIES = 300;
+const RIPGREP_RESOLVE_TIMEOUT_MS = 3000;
+
+let cachedRipgrepCommand: string | null | undefined;
+let lastRipgrepUnavailableReason: string | null = null;
 const MAX_TREE_ENTRIES = 1000;
 const SEARCH_LINE_PREVIEW_CHARS = 800;
 
@@ -130,6 +134,49 @@ function formatSearchMatch(filePath: string, lineNumber: number, lineText: strin
   };
 }
 
+async function resolveRipgrepCommand(): Promise<string | null> {
+  if (cachedRipgrepCommand !== undefined) {
+    return cachedRipgrepCommand;
+  }
+
+  const configured = process.env.RIPGREP_PATH?.trim();
+  const candidates = [configured, 'rg', 'rg.exe'].filter((value): value is string => Boolean(value));
+
+  for (const candidate of candidates) {
+    try {
+      await execFileAsync(candidate, ['--version'], {
+        timeout: RIPGREP_RESOLVE_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      cachedRipgrepCommand = candidate;
+      lastRipgrepUnavailableReason = null;
+      return cachedRipgrepCommand;
+    } catch (error) {
+      lastRipgrepUnavailableReason = (error as Error).message;
+    }
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const { stdout } = await execFileAsync('where.exe', ['rg'], {
+        timeout: RIPGREP_RESOLVE_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      const resolved = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+      if (resolved) {
+        cachedRipgrepCommand = resolved;
+        lastRipgrepUnavailableReason = null;
+        return cachedRipgrepCommand;
+      }
+    } catch (error) {
+      lastRipgrepUnavailableReason = (error as Error).message;
+    }
+  }
+
+  cachedRipgrepCommand = null;
+  return null;
+}
+
 /**
  * 尝试使用 ripgrep 搜索 (高性能)
  * @returns 成功返回 CallToolResult，ripgrep 不可用返回 null
@@ -141,6 +188,11 @@ async function tryRipgrep(
   limit: number,
   ignoredDirs: string[]
 ): Promise<CallToolResult | null> {
+  const rgCommand = await resolveRipgrepCommand();
+  if (!rgCommand) {
+    return null;
+  }
+
   const args = [
     '--color', 'never',
     '--no-heading',
@@ -158,7 +210,7 @@ async function tryRipgrep(
   args.push('--', pattern, base);
 
   try {
-    const { stdout } = await execFileAsync('rg', args, {
+    const { stdout } = await execFileAsync(rgCommand, args, {
       cwd: base,
       timeout: 15000,
       maxBuffer: 5 * 1024 * 1024,
@@ -452,7 +504,7 @@ export function registerSearchTools(server: McpServer): void {
         return rgResult;
       }
 
-      logger.info('ripgrep 不可用，降级为 Node.js 内置搜索');
+      logger.info(`ripgrep 不可用，降级为 Node.js 内置搜索: ${lastRipgrepUnavailableReason ?? 'unknown'}`);
       return await nodeFallbackSearch(pattern, base, filePattern, limit, ignoredDirs);
     }
   );

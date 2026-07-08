@@ -152,6 +152,21 @@ export function assertPathAllowed(targetPath: string): void {
   assertPathNotExcluded(canonicalTarget, matchedWorkspace.realRoot, true);
 }
 
+export function getWorkspaceRootForPath(targetPath: string): string {
+  const resolved = resolvePath(targetPath);
+  const canonicalTarget = canonicalizeTarget(resolved);
+  const matchedWorkspace = getMatchedWorkspace(canonicalTarget);
+
+  if (!matchedWorkspace) {
+    throw new Error(
+      `路径 "${resolved}" 不在允许的工作区目录内。\n` +
+        `允许的工作区: ${config.workspaces.join(', ')}`
+    );
+  }
+
+  return matchedWorkspace.realRoot;
+}
+
 /**
  * 阻止危险操作直接作用于工作区根目录。
  */
